@@ -19,9 +19,14 @@ worktree with the repo's hooks. The review showed what that allows:
 - `pushurl` and `url.*.insteadOf` can redirect the push or fake an "already committed";
 - `core.fsmonitor` can run a command during `git status`;
 - `filter.*` with `.gitattributes` can run a command on every file, and change the bytes hashed;
-- `trailer.*` settings can change the trailers.
+- `trailer.*` settings can change the trailers;
+- a git repository planted inside the worktree brings its own config and attributes, which
+  git honours when it processes that directory, whatever the outer settings say.
 
 So the runner never runs git with the worktree's config or hooks:
+- Before git reads any file, it **refuses a worktree that contains any `.git` besides its
+  own** (a planted repository, or a `.git` file pointing at one), and any listed path that's
+  a directory.
 - It works in **its own bare repository** (`OPS_REPO`), with no system config, its own
   global config (`OPS_GIT_CONFIG`, where its credential lives) and an empty hooks directory.
 - It builds the tree as **`base_sha`'s tree plus the listed paths, read from the worktree
@@ -201,6 +206,8 @@ runner as a subprocess or the coordinator loop.
   - E24 and E25: the coordinator's rebase runs no worktree filter, hook, fsmonitor or remote,
     and a conflict leaves the worktree as it was.
   - E26: gzip and tar files are refused.
+  - E27: a planted git repository with its own filter is refused before git touches it, listed
+    or not, in the runner and the coordinator.
 
 ## Environment
 

@@ -683,5 +683,59 @@ def e26_compressed_archive_refused(w):
         finally:
             ww.close()
 
+
+# ---------------------------------------------------------------- third review
+
+def nested_repo(w, d, mark):
+    """A worker-planted git repository inside the worktree whose own config
+    and attributes define a filter (and fsmonitor) that touch mark."""
+    full = os.path.join(w.wt, d)
+    os.makedirs(full, exist_ok=True)
+    g(full, 'init', '-q')
+    w.identity(full)
+    w.write(full, 'f.txt', 'hi\n')
+    g(full, 'add', '-A')
+    g(full, 'commit', '-q', '-m', 'x')
+    g(full, 'config', 'filter.pwn.clean', f'touch {mark}; cat')
+    g(full, 'config', 'filter.pwn.smudge', f'touch {mark}; cat')
+    g(full, 'config', 'core.fsmonitor', f'touch {mark}; false')
+    with open(os.path.join(full, '.git', 'info', 'attributes'), 'w') as f:
+        f.write('* filter=pwn\n')
+    # Same size, newer mtime: git must re-hash it, through the filter.
+    time.sleep(1.1)
+    os.utime(os.path.join(full, 'f.txt'))
+
+
+@case
+def e27_embedded_repo_never_processed(w):
+    commit = {'type': 'feat', 'scope': 'x', 'summary': 's', 'body': 'b'}
+    for listed in ('lib', 'lib/f.txt'):
+        ww = World()
+        try:
+            mark = os.path.join(ww.tmp, 'pwned')
+            m = ww.chunk(task='chunk_e27')
+            nested_repo(ww, 'lib', mark)
+            files = [{'path': p, 'status': 'M' if ww.in_base(p) else 'A'} for p in ('src/app.py', 'tests/test_auth.py')]
+            files.append({'path': listed, 'status': 'A'})
+            try:
+                coordinator.manifest('chunk_e27', ww.wt, BRANCH, files, 'true', commit)
+                refused = False
+            except ValueError:
+                refused = True
+            ok(refused and not os.path.exists(mark), f'E27 coordinator: listing {listed!r} in a planted repo is refused, nothing runs')
+            r = ww.run({**m, 'files_changed': files})
+            ok(r['status'] == 'MANIFEST_MISMATCH' and not os.path.exists(mark),
+               f'E27 runner: listing {listed!r} in a planted repo is refused, nothing runs', (r.get('status'), r.get('detail'), os.path.exists(mark)))
+        finally:
+            ww.close()
+    # Unlisted: a stray, and nothing runs either.
+    mark = os.path.join(w.tmp, 'pwned')
+    m = w.chunk()
+    nested_repo(w, 'vendor/lib', mark)
+    r = w.run(m)
+    ok(r['status'] == 'MANIFEST_MISMATCH' and not os.path.exists(mark), 'E27 an unlisted planted repo: stray, nothing runs',
+       (r.get('status'), r.get('detail'), os.path.exists(mark)))
+
+
 print(f'\n{passed} passed, {failed} failed')
 sys.exit(1 if failed else 0)
