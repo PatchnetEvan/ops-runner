@@ -14,6 +14,7 @@ bytes give the same tree_sha.
 """
 
 import os
+import stat
 import subprocess
 import tempfile
 
@@ -171,3 +172,79 @@ def worktree_head(worktree):
     p = subprocess.run(['git', '-C', worktree, '-c', 'core.fsmonitor=false', 'rev-parse', '--verify', 'HEAD'],
                        capture_output=True, text=True, env=isolated_env())
     return p.stdout.strip() if p.returncode == 0 else None
+
+
+BLOB_MODES = ('100644', '100755', '120000')
+
+
+def build_tree_from_blobs(git_dir, base, files, blobs, env=None):
+    """Bundle mode: base's tree plus the listed paths, from bytes the caller
+    hands over (blobs: path -> (mode, bytes)), with no worktree at all. Nothing
+    reads a file, so no worktree config, attributes, filters, hooks or planted
+    repository can take part, and nothing can change the bytes mid-run.
+
+    Returns (tree_sha, staged, index, cleanup) like build_tree. Raises
+    RuntimeError if git refuses a path (a .git component, a file where the base
+    has a directory, ...)."""
+    tmpdir = tempfile.mkdtemp(prefix='ops-index-')
+    index = os.path.join(tmpdir, 'index')
+
+    def cleanup():
+        try:
+            os.remove(index)
+        except FileNotFoundError:
+            pass
+        os.rmdir(tmpdir)
+
+    try:
+        run_git(git_dir, 'read-tree', base, env=env, index=index)
+        for status, path in files:
+            if status == 'D':
+                # mode 0 removes the entry; works without a work tree.
+                run_git(git_dir, 'update-index', '-z', '--index-info', env=env, index=index, binary=True,
+                        input=b'0 ' + b'0' * 40 + b'\t' + path.encode() + b'\0')
+                continue
+            mode, data = blobs[path]
+            if mode not in BLOB_MODES:
+                raise RuntimeError(f'{path}: mode {mode} is not a file or symlink mode')
+            sha = run_git(git_dir, 'hash-object', '-w', '--no-filters', '--stdin', env=env, binary=True,
+                          input=data).stdout.decode().strip()
+            # --cacheinfo checks the path itself: no .git component, no file
+            # where the base has a directory (or the reverse).
+            run_git(git_dir, 'update-index', '--add', '--cacheinfo', f'{mode},{sha},{path}', env=env, index=index)
+        diff = run_git(git_dir, 'diff', '--cached', '--name-status', '--no-renames', '-z', base,
+                       env=env, index=index).stdout
+        parts = [d for d in diff.split('\0') if d != '']
+        staged = sorted(((parts[j], parts[j + 1]) for j in range(0, len(parts), 2)), key=lambda x: x[1])
+        tree = run_git(git_dir, 'write-tree', env=env, index=index).stdout.strip()
+        return tree, staged, index, cleanup
+    except Exception:
+        cleanup()
+        raise
+
+
+def read_blobs(worktree, files):
+    """The bytes of the listed A/M paths as git would record them, read once:
+    a symlink is its target, a regular file its contents and the owner's
+    execute bit. Anything else (a directory, a device, a missing file) is
+    refused. Returns {path: (mode, bytes)}."""
+    root = os.path.realpath(worktree)
+    blobs = {}
+    for status, path in files:
+        if status == 'D':
+            continue
+        full = os.path.join(root, path)
+        if not (os.path.realpath(os.path.dirname(full)) + os.sep).startswith(root + os.sep):
+            raise Refused(f'{path} resolves outside the worktree')
+        try:
+            st = os.lstat(full)
+        except FileNotFoundError:
+            raise Refused(f'{path} is listed as {status} but is not on disk')
+        if stat.S_ISLNK(st.st_mode):
+            blobs[path] = ('120000', os.fsencode(os.readlink(full)))
+        elif stat.S_ISREG(st.st_mode):
+            with open(full, 'rb') as f:
+                blobs[path] = ('100755' if st.st_mode & stat.S_IXUSR else '100644', f.read())
+        else:
+            raise Refused(f'{path} is not a regular file or a symlink')
+    return blobs

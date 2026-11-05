@@ -10,8 +10,10 @@ scan's blind spots, spoofed Task-Ids, verify that edits code). Run: python3 test
 Environment: OPS_GITLEAKS (default: gitleaks on PATH, else ~/go/bin/gitleaks).
 """
 
+import base64
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -135,6 +137,17 @@ class World:
         r['_exit'] = p.returncode
         r['_stdout_lines'] = len(lines)
         r['_stderr'] = p.stderr
+        return r
+
+    def run_bundle(self, payload, cmd=None, **extra):
+        """The runner in bundle mode; payload is a dict or raw bytes."""
+        data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        p = subprocess.run(cmd or RUNNER + ['--bundle'], input=data, capture_output=True, env=self.env(**extra))
+        lines = p.stdout.decode().strip().splitlines()
+        r = json.loads(lines[-1]) if lines else {'status': None}
+        r['_exit'] = p.returncode
+        r['_stdout_lines'] = len(lines)
+        r['_stderr'] = p.stderr.decode()
         return r
 
     def commits_with(self, task):
@@ -735,6 +748,209 @@ def e27_embedded_repo_never_processed(w):
     r = w.run(m)
     ok(r['status'] == 'MANIFEST_MISMATCH' and not os.path.exists(mark), 'E27 an unlisted planted repo: stray, nothing runs',
        (r.get('status'), r.get('detail'), os.path.exists(mark)))
+
+
+
+# ---------------------------------------------------------------- bundle mode
+
+@case
+def b01_bundle_clean_chunk(w):
+    m = w.chunk()
+    bundle = coordinator.make_bundle(m)
+    ok('worktree' not in bundle['manifest'] and set(bundle['blobs']) == {'src/app.py', 'tests/test_auth.py'},
+       'B1 the bundle carries the manifest without the worktree, and exactly the listed files')
+    r = w.run_bundle(bundle)
+    ok(r['status'] == 'PUSHED' and r['_exit'] == 0 and r['_stdout_lines'] == 1, 'B1 clean chunk by bundle: PUSHED', r)
+    ok(g(w.origin, 'rev-parse', f'{r.get("commit_sha")}^{{tree}}') == m['tree_sha'], 'B1 the pushed tree is tree_sha')
+    ok(g(w.wt, 'rev-parse', 'HEAD') == m['base_sha'] and 'hello' in open(os.path.join(w.wt, 'src/app.py')).read(),
+       'B1 the worktree is untouched')
+    r2 = w.run_bundle(bundle)
+    ok(r2['status'] == 'ALREADY_COMMITTED' and w.commits_with('chunk_04_auth_endpoints') == 1,
+       'B1 the same bundle again: ALREADY_COMMITTED, one commit', r2['status'])
+
+
+@case
+def b02_bundle_modes_and_deletes_match_local(w):
+    m = w.chunk(edits={'bin/run.sh': '#!/bin/sh\necho hi\n'}, deletes=['src/old.py'])
+    os.chmod(os.path.join(w.wt, 'bin/run.sh'), 0o755)
+    os.symlink('../src/app.py', os.path.join(w.wt, 'bin/app-link'))
+    files = m['files_changed'] + [{'path': 'bin/app-link', 'status': 'A'}]
+    m = coordinator.manifest('chunk_b02', w.wt, BRANCH, files, 'true', m['commit'])
+    bundle = coordinator.make_bundle(m)  # raises unless the bytes hash to the git-add tree
+    ok(bundle['blobs']['bin/run.sh']['mode'] == '100755' and bundle['blobs']['bin/app-link']['mode'] == '120000',
+       'B2 the execute bit and the symlink are carried as git records them')
+    r = w.run_bundle(bundle)
+    ok(r['status'] == 'PUSHED', 'B2 executable, symlink and deletion by bundle: PUSHED', r)
+    ls = g(w.origin, 'ls-tree', '-r', r.get('commit_sha') or 'HEAD')
+    ok('100755 blob' in [l for l in ls.splitlines() if l.endswith('bin/run.sh')][0]
+       and '120000 blob' in [l for l in ls.splitlines() if l.endswith('bin/app-link')][0]
+       and 'src/old.py' not in ls, 'B2 the pushed tree has the modes and the deletion')
+
+
+@case
+def b03_bundle_tampered_bytes(w):
+    m = w.chunk()
+    bundle = coordinator.make_bundle(m)
+    bundle['blobs']['src/app.py']['data'] = base64.b64encode(b'def hello():\n    return "evil"\n').decode()
+    r = w.run_bundle(bundle)
+    ok(r['status'] == 'MANIFEST_MISMATCH' and 'tree_sha' in r['detail'], 'B3 bytes that are not the verified tree: refused', r)
+    ok(w.commits_with('chunk_04_auth_endpoints') == 0, 'B3 nothing pushed')
+
+
+@case
+def b04_bundle_shape_refused(w):
+    m = w.chunk()
+    good = coordinator.make_bundle(m)
+    def variant(fn):
+        b = json.loads(json.dumps(good))
+        fn(b)
+        return b
+    cases = {
+        'a listed file without its bytes': variant(lambda b: b['blobs'].pop('tests/test_auth.py')),
+        'bytes for an unlisted file': variant(lambda b: b['blobs'].update({'src/extra.py': {'mode': '100644', 'data': ''}})),
+        'a submodule mode': variant(lambda b: b['blobs']['src/app.py'].update(mode='160000')),
+        'a directory mode': variant(lambda b: b['blobs']['src/app.py'].update(mode='040000')),
+        'data that is not base64': variant(lambda b: b['blobs']['src/app.py'].update(data='@@@')),
+        'an extra top-level key': variant(lambda b: b.update(worktree=w.wt)),
+        'a .git path': variant(lambda b: (b['manifest']['files_changed'].append({'path': 'x/.git/config', 'status': 'A'}),
+                                          b['blobs'].update({'x/.git/config': {'mode': '100644', 'data': ''}}))),
+        'a .GIT path': variant(lambda b: (b['manifest']['files_changed'].append({'path': 'X/.GIT/hooks/pre-push', 'status': 'A'}),
+                                          b['blobs'].update({'X/.GIT/hooks/pre-push': {'mode': '100755', 'data': ''}}))),
+        'a file where the base has a directory': variant(lambda b: (b['manifest']['files_changed'].append({'path': 'src', 'status': 'A'}),
+                                                                    b['blobs'].update({'src': {'mode': '100644', 'data': ''}}))),
+        'main': variant(lambda b: b['manifest'].update(target_branch='Main')),
+    }
+    for name, b in cases.items():
+        r = w.run_bundle(b)
+        ok(r['status'] == 'MANIFEST_MISMATCH' and r['_stdout_lines'] == 1, f'B4 {name}: refused', (r['status'], r['detail'][:120]))
+        if os.environ.get('SHOW_DETAIL'):
+            print('      ->', r['detail'][:150])
+    r = w.run_bundle(b'{not json')
+    ok(r['status'] == 'MANIFEST_MISMATCH' and r['_stdout_lines'] == 1, 'B4 not JSON: one JSON answer')
+    ok(w.commits_with('chunk_04_auth_endpoints') == 0, 'B4 nothing pushed')
+
+
+@case
+def b05_bundle_secret(w):
+    m = w.chunk(edits={'src/config.py': f'aws_access_key_id = "{FAKE_AWS}"\n'})
+    r = w.run_bundle(coordinator.make_bundle(m))
+    ok(r['status'] == 'HOOK_FAILED' and 'secrets_found' in r['detail'], 'B5 a secret in a bundle: HOOK_FAILED', r['status'])
+
+
+@case
+def b06_bundle_never_reads_the_worktree(w):
+    mark = os.path.join(w.tmp, 'pwned')
+    m = w.chunk()
+    bundle = coordinator.make_bundle(m)
+    # After bundling: a planted repository with a filter, hostile config, and
+    # then the worktree gone entirely. None of it can matter.
+    nested_repo(w, 'lib', mark)
+    hostile_config(w, [mark] * 4)
+    shutil.rmtree(w.wt)
+    r = w.run_bundle(bundle)
+    ok(r['status'] == 'PUSHED' and not os.path.exists(mark), 'B6 the runner never reads the worktree (planted repo, then deleted): PUSHED, nothing ran', (r['status'], os.path.exists(mark)))
+
+
+@case
+def b07_bundle_size_limit(w):
+    m = w.chunk(edits={'data/big.txt': 'x' * (2 * 1024 * 1024)})
+    r = w.run_bundle(coordinator.make_bundle(m), OPS_BUNDLE_MAX_MB='1')
+    ok(r['status'] == 'MANIFEST_MISMATCH' and 'larger than' in r['detail'] and r['_stdout_lines'] == 1,
+       'B7 a bundle over OPS_BUNDLE_MAX_MB: refused', r['status'])
+
+
+@case
+def b08_files_changed_after_verify(w):
+    m = w.chunk()
+    w.write(w.wt, 'src/app.py', 'def hello():\n    return "changed after verify"\n')
+    r = coordinator.run_ops(m, runner=['sh', '-c', 'cat >/dev/null; echo called'], env=w.env(), bundle=True)
+    ok(r['status'] == 'MANIFEST_MISMATCH' and 'changed since' in r['detail'], 'B8 a file changed after verify: no bundle is sent', r)
+    ok(w.commits_with('chunk_04_auth_endpoints') == 0, 'B8 nothing pushed')
+
+
+@case
+def b09_loop_over_runner_command(w):
+    # The coordinator loop with OPS_RUNNER_CMD set: bundles go to "another
+    # machine" (here the SSH entry script, with its env file), and a stale base
+    # is recovered as before.
+    envfile = os.path.join(w.tmp, 'ops.env')
+    with open(envfile, 'w') as f:
+        for k, v in w.env().items():
+            if k.startswith('OPS_'):
+                f.write(f'{k}={shlex.quote(v)}\n')
+    entry = os.path.join(ROOT, 'deploy', 'ssh-entry.sh')
+    m = w.chunk()
+    w.land_other()
+    statuses = []
+    e = {**w.env(), 'OPS_RUNNER_CMD': f'sh {shlex.quote(entry)}', 'OPS_ENV_FILE': envfile,
+         'SSH_ORIGINAL_COMMAND': 'rm -rf /'}  # what an SSH client asked for; ignored
+
+    def run(mm):
+        r = coordinator.run_ops(mm, env=e)
+        statuses.append(r['status'])
+        return r
+    outcome, sha = coordinator.land_chunk(m, run_ops=run, remote_url=w.origin)
+    ok(outcome == 'done' and statuses == ['STALE_BASE', 'PUSHED'], 'B9 the loop over OPS_RUNNER_CMD: stale base, rebase, PUSHED', statuses)
+    ok(g(w.origin, 'rev-parse', f'{sha}^{{tree}}') == m['tree_sha'], 'B9 what landed is the re-verified tree')
+
+
+@case
+def c01_credential_helper(w):
+    import http.server
+    import threading
+    import gh_app_credential as helper
+    key = os.path.join(w.tmp, 'app.pem')
+    pub = os.path.join(w.tmp, 'app.pub')
+    sh(w.tmp, 'openssl', 'genpkey', '-algorithm', 'RSA', '-pkeyopt', 'rsa_keygen_bits:2048', '-out', key)
+    sh(w.tmp, 'openssl', 'pkey', '-in', key, '-pubout', '-out', pub)
+    seen = {}
+
+    class API(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            jwt = self.headers['Authorization'].split(' ', 1)[1]
+            h, c, sig = jwt.split('.')
+            pad = lambda x: x + '=' * (-len(x) % 4)
+            sigf = os.path.join(w.tmp, 'sig')
+            with open(sigf, 'wb') as f:
+                f.write(base64.urlsafe_b64decode(pad(sig)))
+            v = subprocess.run(['openssl', 'dgst', '-sha256', '-verify', pub, '-signature', sigf],
+                               input=f'{h}.{c}'.encode(), capture_output=True)
+            seen.update(path=self.path, verified=v.returncode == 0,
+                        claims=json.loads(base64.urlsafe_b64decode(pad(c))),
+                        body=json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+            out = json.dumps({'token': 'ghs_TESTTOKEN'}).encode()
+            self.send_response(201)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+    srv = http.server.HTTPServer(('127.0.0.1', 0), API)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    cmd = [sys.executable, os.path.join(ROOT, 'gh_app_credential.py'), 'get']
+    e = {k: v for k, v in os.environ.items() if not k.lower().endswith('_proxy')}
+    e.update(OPS_GH_API=f'http://127.0.0.1:{srv.server_port}', OPS_GH_APP_ID='12345', OPS_GH_INSTALLATION_ID='678',
+             OPS_GH_APP_KEY=key, OPS_GH_REPO='chamber-impact-networking')
+    try:
+        p = subprocess.run(cmd, input='protocol=https\nhost=github.com\n\n', capture_output=True, text=True, env=e)
+        ok(p.returncode == 0 and p.stdout == 'username=x-access-token\npassword=ghs_TESTTOKEN\n',
+           'C1 github.com: an installation token for git', (p.returncode, p.stderr))
+        ok(seen.get('verified') and seen.get('path') == '/app/installations/678/access_tokens'
+           and seen['claims']['iss'] == '12345' and seen['claims']['exp'] - seen['claims']['iat'] <= 600,
+           'C1 the JWT is signed by the App key, names the App, and lasts at most 10 minutes', seen.get('claims'))
+        ok(seen.get('body') == {'permissions': {'contents': 'write'}, 'repositories': ['chamber-impact-networking']},
+           'C1 the token asked for is one repository, contents:write only', seen.get('body'))
+        p = subprocess.run(cmd, input='protocol=https\nhost=evil.example\n\n', capture_output=True, text=True, env=e)
+        ok(p.returncode == 0 and p.stdout == '', 'C1 any other host: no credential')
+        p = subprocess.run(cmd, input='protocol=https\nhost=github.com\n\n', capture_output=True, text=True,
+                           env={**e, 'OPS_GH_API': 'http://127.0.0.1:1'})
+        ok(p.returncode == 1 and p.stdout == '' and 'BEGIN' not in p.stderr and 'eyJ' not in p.stderr,
+           'C1 a failure gives no credential and leaks neither key nor JWT', p.stderr.strip())
+    finally:
+        srv.shutdown()
 
 
 print(f'\n{passed} passed, {failed} failed')

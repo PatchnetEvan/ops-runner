@@ -63,6 +63,7 @@ No worktree filter, hook or fsmonitor runs at any step.
 
 ```bash
 python3 ops_reconcile.py manifest.json      # or the manifest on stdin
+python3 ops_reconcile.py --bundle < bundle.json
 ```
 
 It prints exactly one JSON object on stdout:
@@ -94,6 +95,52 @@ How `files_changed` works:
 
 The coordinator builds a manifest with `coordinator.manifest(...)`, which stages the listed paths
 and hashes the tree. `coordinator.land_chunk(m)` is the retry loop from the spec.
+
+## Bundle mode: the runner on its own machine
+
+In production the runner lives on a machine of its own, where only it holds the push
+credential. It can't read the coordinator's worktrees there, so the coordinator sends each
+chunk as one bundle on stdin:
+
+```json
+{"manifest": {"task_id": "...", "base_sha": "...", "target_branch": "...", "files_changed": [...],
+              "tree_sha": "...", "commit": {...}},
+ "blobs": {"src/routes/auth.py": {"mode": "100644", "data": "<base64 of the file's bytes>"}}}
+```
+
+How bundles are built and checked:
+- **Contents:** one blob for every listed `A` or `M` path and no other. The mode is `100644`,
+  `100755` (executable) or `120000` (a symlink; the data is its target). `worktree` isn't needed.
+- **No worktree at all:** the runner hashes the bytes straight into its own repository
+  (`hash-object --no-filters`, `update-index --cacheinfo`) and never reads a file. No worktree
+  config, attribute, filter, hook or planted repository takes part, and no worker can change
+  the bytes mid-run. That closes the race the worktree-mode check leaves open.
+- **Same checks after that:** the same tree, scan, commit and push checks as worktree mode run
+  on those bytes. Bytes that don't hash to `tree_sha` are refused.
+- **Coordinator side:** `coordinator.make_bundle(m)` reads each listed file once, after verify.
+  It refuses to send anything if those bytes no longer hash to the verified `tree_sha`.
+- **When it's used:** set `OPS_RUNNER_CMD` (for example `ssh -i KEY ops-runner@HOST`) and
+  `run_ops` and `land_chunk` send bundles there.
+- **On the runner's machine:** `deploy/ssh-entry.sh` is the SSH forced command. It loads
+  `/etc/ops-runner/env` and runs `ops_reconcile.py --bundle`, ignoring whatever command the
+  client asked for.
+- **Size:** bundles over `OPS_BUNDLE_MAX_MB` (default 100) are refused.
+
+### Push credential: the GitHub App helper
+
+`gh_app_credential.py` is a git credential helper. On each push it signs a JWT with the
+runner's GitHub App key and exchanges it for a one-hour installation token, limited to one
+repository with `contents: write`. Nothing is cached. Put it in the git config that
+`OPS_GIT_CONFIG` names:
+
+```ini
+[credential "https://github.com"]
+    helper = !python3 /opt/ops-runner/gh_app_credential.py
+```
+
+It needs `OPS_GH_APP_ID`, `OPS_GH_INSTALLATION_ID`, `OPS_GH_APP_KEY` (the `.pem` path) and
+`OPS_GH_REPO`. It signs with the `openssl` command. For any host but `github.com` it gives no
+credential.
 
 ## Order of checks (first failure returns)
 
@@ -208,6 +255,28 @@ runner as a subprocess or the coordinator loop.
   - E26: gzip and tar files are refused.
   - E27: a planted git repository with its own filter is refused before git touches it, listed
     or not, in the runner and the coordinator.
+- **Bundle mode:**
+  - B1: a clean chunk is `PUSHED` and the same bundle again is `ALREADY_COMMITTED`.
+  - B2: executable files, symlinks and deletions give the same tree as worktree mode.
+  - B3: tampered bytes are refused.
+  - B4: malformed bundles are refused, each with one JSON answer:
+    - a missing or unlisted blob;
+    - a submodule or directory mode;
+    - bad base64;
+    - a `.git` path;
+    - a file where the base has a directory;
+    - `main`.
+  - B5: a secret is caught.
+  - B6: the worktree is never read, even with a planted repository in it, or with it deleted.
+  - B7: the size limit holds.
+  - B8: a file changed after verify means no bundle is sent.
+  - B9: the coordinator loop works through `OPS_RUNNER_CMD` and the SSH entry script,
+    including stale-base recovery.
+- **Credential helper:**
+  - C1: the JWT is signed by the App key and names the App.
+  - C1: the token asked for is one repository with `contents: write` only.
+  - C1: other hosts get no credential.
+  - C1: a failure leaks neither the key nor the JWT.
 
 ## Environment
 
@@ -221,12 +290,17 @@ runner as a subprocess or the coordinator loop.
 | `OPS_GITLEAKS_CONFIG` | `gitleaks.toml` next to the runner |
 | `OPS_SCAN_MAX_MB` | `50` |
 | `OPS_AUTHOR_NAME`, `OPS_AUTHOR_EMAIL` | `ops-runner` |
+| `OPS_BUNDLE_MAX_MB` | `100`: the largest bundle read from stdin |
+| `OPS_GH_APP_ID`, `OPS_GH_INSTALLATION_ID`, `OPS_GH_APP_KEY`, `OPS_GH_REPO` | the credential helper's App, installation, key path and repository |
+| `OPS_ENV_FILE` | `/etc/ops-runner/env`: the file `deploy/ssh-entry.sh` loads |
+| `OPS_RUNNER_CMD` | coordinator side: the command that reaches the runner's machine; bundles are sent when it is set |
 | `OPS_TEST_PAUSE_FILE` | tests only: makes the runner pause before the push |
 
 The coordinator reads `OPS_REMOTE_URL` too (or `land_chunk(..., remote_url=...)`). It needs
 read access only.
 
-Requires Python 3.9+ and git 2.38+ (for `merge-tree --write-tree`).
+Requires Python 3.9+, git 2.38+ (for `merge-tree --write-tree`) and, for the credential helper,
+the `openssl` command.
 
 The runner is only a real boundary once it is the only thing that can push: see
 [docs/infrastructure.md](docs/infrastructure.md).

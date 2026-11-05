@@ -6,6 +6,7 @@ stash, no file edits, no tests.
 
 Usage:
     ops_reconcile.py MANIFEST.json      # or the manifest on stdin
+    ops_reconcile.py --bundle           # a bundle on stdin (see below)
 Prints exactly one JSON object to stdout. Exit 0 for PUSHED and
 ALREADY_COMMITTED, 1 for everything else. Logs go to stderr.
 
@@ -16,6 +17,14 @@ repository (OPS_REPO), reads the worktree's files as plain data, commits with
 commit-tree (no hooks), and pushes to the URL it was configured with
 (OPS_REMOTE_URL), never to a remote the worktree names. The worktree itself is
 left exactly as it was.
+
+Bundle mode (--bundle) is for a runner on its own machine. Stdin holds
+    {"manifest": {...}, "blobs": {"<path>": {"mode": "100644", "data": "<base64>"}}}
+with one blob for every listed A or M path and none other; "worktree" is not
+needed. The runner never reads a worktree: it hashes those bytes straight into
+its own repository, so no worker can change them mid-run, and no worktree
+config, attribute, filter, hook or planted repository takes part. Modes are
+100644, 100755 (executable) or 120000 (a symlink; data is its target).
 
 Checks run in this order, and the first failure returns:
   1. validate the manifest, take a lock per target branch
@@ -41,8 +50,11 @@ Environment:
   OPS_GITLEAKS_CONFIG   gitleaks config (default gitleaks.toml next to this file)
   OPS_SCAN_MAX_MB       largest file the scan reads (default 50); bigger = refused
   OPS_AUTHOR_NAME/EMAIL the commit identity (default "ops-runner")
+  OPS_BUNDLE_MAX_MB     largest bundle read from stdin (default 100)
 """
 
+import base64
+import binascii
 import fcntl
 import hashlib
 import json
@@ -89,13 +101,14 @@ class Result(Exception):
 
 # ---------------------------------------------------------------- 1. validate
 
-def validate(m):
+def validate(m, bundle=False):
     def bad(why):
         raise Result(MANIFEST_MISMATCH, f'invalid manifest: {why}')
 
     if not isinstance(m, dict):
         bad('not an object')
-    for k in ('task_id', 'worktree', 'base_sha', 'target_branch', 'files_changed', 'tree_sha', 'commit'):
+    for k in ('task_id', 'base_sha', 'target_branch', 'files_changed', 'tree_sha', 'commit') + \
+            (() if bundle else ('worktree',)):
         if k not in m:
             bad(f'missing {k}')
     if not isinstance(m['task_id'], str) or not TASK_RE.match(m['task_id']):
@@ -108,10 +121,12 @@ def validate(m):
         bad('target_branch is not an acceptable branch name')
     if b.lower() in PROTECTED:
         bad('the runner never pushes to main')
-    wt = m['worktree']
-    if not isinstance(wt, str) or not os.path.isabs(wt) or not os.path.isdir(wt):
-        bad('worktree must be an existing absolute directory')
-    wt = os.path.realpath(wt)
+    wt = None
+    if not bundle:
+        wt = m['worktree']
+        if not isinstance(wt, str) or not os.path.isabs(wt) or not os.path.isdir(wt):
+            bad('worktree must be an existing absolute directory')
+        wt = os.path.realpath(wt)
 
     files = m['files_changed']
     if not isinstance(files, list) or not files:
@@ -129,9 +144,10 @@ def validate(m):
         parts = path.split('/')
         if any(p in ('', '.', '..') for p in parts) or any(p.lower() == '.git' for p in parts):
             bad(f'path {path!r} must stay inside the worktree')
-        full = os.path.realpath(os.path.join(wt, path))
-        if not full.startswith(wt + os.sep):
-            bad(f'path {path!r} resolves outside the worktree')
+        if not bundle:
+            full = os.path.realpath(os.path.join(wt, path))
+            if not full.startswith(wt + os.sep):
+                bad(f'path {path!r} resolves outside the worktree')
         if path in seen:
             bad(f'path {path!r} listed twice')
         seen.add(path)
@@ -155,6 +171,36 @@ def validate(m):
         bad('commit text must not carry Task-Id or Verified-Base lines; the runner adds them')
 
     return {**m, 'worktree': wt, 'files': sorted(norm, key=lambda x: x[1])}
+
+
+def read_bundle(raw):
+    """Split a bundle into its manifest and {path: (mode, bytes)}. The blobs
+    must be exactly the listed A and M paths."""
+    def bad(why):
+        raise Result(MANIFEST_MISMATCH, f'invalid bundle: {why}')
+
+    if not isinstance(raw, dict) or set(raw) != {'manifest', 'blobs'}:
+        bad('expected {"manifest": ..., "blobs": ...}')
+    m = validate(raw['manifest'], bundle=True)
+    given = raw['blobs']
+    if not isinstance(given, dict):
+        bad('blobs must be an object')
+    want = {p for s, p in m['files'] if s != 'D'}
+    if set(given) != want:
+        missing, extra = sorted(want - set(given)), sorted(set(given) - want)
+        bad(f'blobs must be exactly the listed A and M paths (missing {missing[:10]}, unlisted {extra[:10]})')
+    blobs = {}
+    for path, b in given.items():
+        if not isinstance(b, dict) or set(b) != {'mode', 'data'}:
+            bad(f'{path}: each blob is {{mode, data}}')
+        if b['mode'] not in treebuild.BLOB_MODES:
+            bad(f'{path}: mode must be one of {", ".join(treebuild.BLOB_MODES)}')
+        try:
+            data = base64.b64decode(b['data'], validate=True)
+        except (binascii.Error, TypeError, ValueError):
+            bad(f'{path}: data is not base64')
+        blobs[path] = (b['mode'], data)
+    return m, blobs
 
 
 def lock(branch):
@@ -201,7 +247,7 @@ def ls_remote(repo, url, branch):
 
 # ---------------------------------------------------------------- the run
 
-def run(m, out):
+def run(m, out, blobs=None):
     repo, url = ops_repo(), remote_url()
     wt, branch, base, task, tree_sha = m['worktree'], m['target_branch'], m['base_sha'], m['task_id'], m['tree_sha']
     tracking = 'refs/ops/' + hashlib.sha256(url.encode()).hexdigest()[:16] + '/' + branch
@@ -224,16 +270,22 @@ def run(m, out):
         raise Result(MANIFEST_MISMATCH, f'Task-Id {task} is already used on {branch} by {sha}, '
                                         f'which is not this chunk (tree, parent or Verified-Base differ)')
 
-    # 3. Stale base? Remote first, then the worktree.
+    # 3. Stale base? Remote first, then the worktree (bundle mode has none).
     if tip != base:
         raise Result(STALE_BASE, f'remote tip {tip} is not base_sha {base}')
-    head = treebuild.worktree_head(wt)
-    if head != base:
-        raise Result(MANIFEST_MISMATCH, f'worktree HEAD {head} is not base_sha {base}')
+    if blobs is None:
+        head = treebuild.worktree_head(wt)
+        if head != base:
+            raise Result(MANIFEST_MISMATCH, f'worktree HEAD {head} is not base_sha {base}')
 
     # 4-6. Stage base + the listed paths in a private index; no strays; tree matches.
     try:
-        tree, strays, staged, index, cleanup = treebuild.build_tree(repo, wt, base, m['files'], env=env())
+        if blobs is None:
+            tree, strays, staged, index, cleanup = treebuild.build_tree(repo, wt, base, m['files'], env=env())
+        else:
+            # Only the listed paths exist in a bundle: nothing can be stray.
+            tree, staged, index, cleanup = treebuild.build_tree_from_blobs(repo, base, m['files'], blobs, env=env())
+            strays = []
     except RuntimeError as e:
         raise Result(MANIFEST_MISMATCH, f'cannot stage the listed paths: {e}')
     try:
@@ -368,19 +420,32 @@ def scan(repo, index, files):
 def main(argv):
     result = {'task_id': None, 'status': None, 'commit_sha': None, 'remote_ref': None, 'remote_sha': None, 'detail': ''}
     out = {}
+    bundle = '--bundle' in argv[1:]
+    args = [a for a in argv[1:] if a != '--bundle']
+    blobs = None
     try:
         try:
-            raw = open(argv[1]).read() if len(argv) > 1 and argv[1] != '-' else sys.stdin.read()
+            if bundle:
+                limit = int(os.environ.get('OPS_BUNDLE_MAX_MB', '100')) * 1024 * 1024
+                raw = sys.stdin.buffer.read(limit + 1)
+                if len(raw) > limit:
+                    raise Result(MANIFEST_MISMATCH, f'invalid bundle: larger than {limit // 1024 // 1024} MB')
+            else:
+                raw = open(args[0]).read() if args and args[0] != '-' else sys.stdin.read()
             m = json.loads(raw)
-        except (OSError, json.JSONDecodeError) as e:
+        except (OSError, ValueError) as e:
             raise Result(MANIFEST_MISMATCH, f'invalid manifest: cannot read it as JSON ({e})')
-        if isinstance(m, dict) and isinstance(m.get('task_id'), str):
-            result['task_id'] = m['task_id']
-        m = validate(m)
+        mm = m.get('manifest') if bundle and isinstance(m, dict) else m
+        if isinstance(mm, dict) and isinstance(mm.get('task_id'), str):
+            result['task_id'] = mm['task_id']
+        if bundle:
+            m, blobs = read_bundle(m)
+        else:
+            m = validate(m)
         result['remote_ref'] = f"refs/heads/{m['target_branch']}"
         try:
             lock(m['target_branch'])
-            run(m, out)
+            run(m, out, blobs)
         except Result:
             raise
         except Exception as e:  # anything the checks didn't name
