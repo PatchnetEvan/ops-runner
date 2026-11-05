@@ -34,6 +34,34 @@ EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 CONFIG_FILES = ('.gitignore', '.gitattributes')
 
 
+class Refused(RuntimeError, ValueError):
+    """The worktree holds something git must not process at all."""
+
+
+def refuse_embedded_repos(worktree, files):
+    """Before any git command reads the worktree's files: refuse any .git
+    other than the worktree's own, anywhere in it, and any listed path that
+    is a directory.
+
+    A git repository planted inside the worktree has its own config and
+    info/attributes, which git honours when it processes that directory
+    (e.g. re-hashing a file through that repository's filter during
+    `git add`), and nothing passed with -c or GIT_ATTR_SOURCE overrides
+    them. So such a directory must never reach git."""
+    root = os.path.realpath(worktree)
+    for dirpath, dirnames, filenames in os.walk(root):
+        if dirpath == root and '.git' in dirnames + filenames:
+            dirnames[:] = [d for d in dirnames if d != '.git']
+            filenames = [f for f in filenames if f != '.git']
+        if '.git' in dirnames or '.git' in filenames:
+            rel = os.path.relpath(dirpath, root)
+            raise Refused(f'{rel} is an embedded git repository; nothing was staged')
+    for status, path in files:
+        full = os.path.join(root, path)
+        if status in ('A', 'M') and os.path.isdir(full) and not os.path.islink(full):
+            raise Refused(f'{path} is a directory; list files only')
+
+
 def isolated_env(global_config=None, extra=None):
     """No system config; a global config the caller chooses (default: none)."""
     env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
@@ -67,6 +95,7 @@ def build_tree(git_dir, worktree, base, files, env=None):
     lines that are not fully staged (untracked files, unlisted changes) and
     staged is the sorted [(status, path)] actually staged against base.
     The caller must call cleanup() when done with the index."""
+    refuse_embedded_repos(worktree, files)
     tmpdir = tempfile.mkdtemp(prefix='ops-index-')
     index = os.path.join(tmpdir, 'index')
 

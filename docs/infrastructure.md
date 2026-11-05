@@ -42,6 +42,14 @@ For Evan to set up; the coordinator can't change credentials or repo settings.
 - [ ] Python 3.9+, git 2.38+.
 - [ ] The runner reads the worktree's files, so it needs read access to the worktrees. It
       needs no write access to them.
+- [ ] **The worker is stopped while its chunk lands.** The coordinator ends the worker's turn
+      before it hashes, verifies and runs the runner, and doesn't hand the worktree back until
+      the runner answers. The runner refuses a worktree that holds a planted git repository,
+      but a worker still writing during the run could create one after that check and before
+      git reads the files (a race of a few milliseconds, which a review couldn't win in 460
+      tries).
+- [ ] **No submodules in worktrees.** Any `.git` inside a worktree other than its own is
+      refused, so a checked-out submodule fails every chunk.
 - [ ] A lock directory the runner can write: `OPS_LOCK_DIR`, default `/var/lock`.
 - [ ] Run `python3 tests/harness.py` in the image before first use. Every case must pass.
 - [ ] The coordinator's environment sets `OPS_REMOTE_URL` too, with read-only access.
