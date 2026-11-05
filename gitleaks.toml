@@ -1,0 +1,6 @@
+# The runner's own gitleaks config. Passed with --config, so a .gitleaks.toml
+# in the scanned repo can't relax the rules. Extends gitleaks' default rules.
+title = "ops-runner"
+
+[extend]
+useDefault = true
