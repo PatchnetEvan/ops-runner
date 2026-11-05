@@ -34,9 +34,14 @@ For Evan to set up; the coordinator can't change credentials or repo settings.
 
 ## The runner's image
 
-- [ ] Pin gitleaks. The tests ran on v8.21.2, using the `dir` subcommand on a copy of the
-      staged contents.
+- [ ] Pin gitleaks to v8.21.2. `gitleaks.toml` is that version's default rules without the
+      global path allowlist; regenerate it if you change versions.
+- [ ] Set `OPS_REMOTE_URL` to the repository's URL, and `OPS_GIT_CONFIG` to a git config that
+      holds the runner's credential helper. Nothing else on the machine should hold it.
+- [ ] Give the runner its own `OPS_REPO` directory (a bare repository it creates).
 - [ ] Python 3.9+, git 2.32+.
+- [ ] The runner reads the worktree's files, so it needs read access to the worktrees. It
+      needs no write access to them.
 - [ ] A lock directory the runner can write: `OPS_LOCK_DIR`, default `/var/lock`.
 - [ ] Run `python3 tests/harness.py` in the image before first use. Every case must pass.
 
