@@ -60,6 +60,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -131,6 +132,9 @@ def validate(m, bundle=False):
     files = m['files_changed']
     if not isinstance(files, list) or not files:
         bad('files_changed must be a non-empty list')
+    max_files = int(os.environ.get('OPS_MAX_FILES', '5000'))
+    if len(files) > max_files:
+        bad(f'files_changed lists {len(files)} paths; the most a chunk may change is {max_files}')
     seen, norm = set(), []
     for f in files:
         if not isinstance(f, dict) or set(f) != {'path', 'status'}:
@@ -297,14 +301,12 @@ def run(m, out, blobs=None):
             raise Result(MANIFEST_MISMATCH, f'staged tree {tree} is not tree_sha {tree_sha}')
 
         # 7. Secrets scan of exactly the staged contents.
-        scan(repo, index, m['files'])
+        scan(repo, index, m['files'], commit_message(m) + f"\nBranch: {branch}\n")
     finally:
         cleanup()
 
     # 8. Commit: the verified tree on base_sha, with the runner's own message.
-    c = m['commit']
-    subject = f"{c['type']}({c['scope']}): {c['summary']}" if c.get('scope') else f"{c['type']}: {c['summary']}"
-    message = f"{subject}\n\n{c['body'].strip()}\n\nTask-Id: {task}\nVerified-Base: {base}\n"
+    message = commit_message(m)
     ident = {'GIT_AUTHOR_NAME': os.environ.get('OPS_AUTHOR_NAME', 'ops-runner'),
              'GIT_AUTHOR_EMAIL': os.environ.get('OPS_AUTHOR_EMAIL', 'ops-runner@localhost'),
              'GIT_COMMITTER_NAME': os.environ.get('OPS_AUTHOR_NAME', 'ops-runner'),
@@ -360,59 +362,118 @@ def pause_for_tests():
         time.sleep(0.05)
 
 
-def scan(repo, index, files):
+def commit_message(m):
+    c = m['commit']
+    subject = f"{c['type']}({c['scope']}): {c['summary']}" if c.get('scope') else f"{c['type']}: {c['summary']}"
+    return f"{subject}\n\n{c['body'].strip()}\n\nTask-Id: {m['task_id']}\nVerified-Base: {m['base_sha']}\n"
+
+
+# gitleaks reads a file in 10,000-byte chunks that don't overlap, and stops
+# reading a file at the first chunk that looks binary. So each blob is scanned
+# as overlapping windows that gitleaks reads in one piece: a 1,024-byte header,
+# then WINDOW bytes of the blob, starting every STEP bytes. Any match up to
+# STEP bytes long lies whole inside some window. The header holds a canary key
+# and fills every offset file-type sniffing looks at; the canary must be found
+# in every window, or that window wasn't read and nothing is committed.
+WINDOW, STEP, HEADER = 8000, 4000, 1024
+PRIVATE_KEY = re.compile(rb'-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY')
+
+
+def windows(blob):
+    if len(blob) <= WINDOW:
+        return [blob]
+    return [blob[o:o + WINDOW] for o in range(0, len(blob) - WINDOW + STEP, STEP)]
+
+
+def window_header(canary):
+    first = f'ops_scan_canary = "{canary}"\n'.encode()
+    pad = HEADER - len(first) - 1
+    return first + (b'#' * 79 + b'\n') * (pad // 80) + b'#' * (pad % 80) + b'\n'
+
+
+def scan(repo, index, files, message):
     """Scan exactly what will be committed: the staged blob of every added or
-    modified file, copied into an empty directory, with the runner's own
-    config. Nothing in the repo can configure the scan: config and ignore
-    files are renamed in the copy (still scanned as content), gitleaks:allow
-    comments are ignored, encoded secrets are decoded, and a file too large
-    to scan is refused rather than skipped."""
+    modified file, and the commit message, with the runner's own config.
+    Nothing in the repo can configure the scan: config and ignore files are
+    renamed in the copy (still scanned as content), gitleaks:allow comments
+    are ignored, encoded secrets are decoded, a private key block is refused
+    outright, and anything gitleaks didn't read (too large, an archive, or a
+    window it took for binary) means nothing is committed."""
     binary = os.environ.get('OPS_GITLEAKS', 'gitleaks')
     config = os.environ.get('OPS_GITLEAKS_CONFIG', os.path.join(HERE, 'gitleaks.toml'))
-    max_mb = int(os.environ.get('OPS_SCAN_MAX_MB', '50'))
+    max_bytes = int(os.environ.get('OPS_SCAN_MAX_MB', '50')) * 1_000_000
+    canary = 'AKIA' + ''.join(secrets.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ234567') for _ in range(16))
+    header = window_header(canary)
+    items = []  # (label, path to name the copy after, bytes)
+    for status, path in files:
+        if status == 'D':
+            continue
+        entry = run_git(repo, 'ls-files', '-s', '-z', '--', path, env=env(), index=index).stdout.split('\0')[0]
+        mode = entry.split(' ')[0] if entry else ''
+        if mode == '160000':
+            raise Result(MANIFEST_MISMATCH, f'{path} is a submodule; the runner does not push submodule changes')
+        blob = run_git(repo, 'show', f':{path}', env=env(), index=index, binary=True).stdout
+        if len(blob) > max_bytes:
+            raise Result(HOOK_FAILED, f'{path} is larger than {max_bytes // 1_000_000} MB and cannot be scanned; nothing was committed')
+        if is_archive(blob):
+            raise Result(HOOK_FAILED, f'{path} is a compressed archive, which the scan cannot see inside; nothing was committed')
+        items.append((path, path, blob))
+    items.append(('the commit message', 'COMMIT_EDITMSG', message.encode()))
+    for label, _, blob in items:
+        if PRIVATE_KEY.search(blob):
+            raise Result(HOOK_FAILED, json.dumps({'secrets_found': [{'rule': 'private-key', 'file': label}]}))
+
     with tempfile.TemporaryDirectory() as tree, tempfile.TemporaryDirectory() as empty, \
             tempfile.NamedTemporaryFile('r', suffix='.json') as report:
-        for n, (status, path) in enumerate(files):
-            if status == 'D':
-                continue
-            entry = run_git(repo, 'ls-files', '-s', '-z', '--', path, env=env(), index=index).stdout.split('\0')[0]
-            mode = entry.split(' ')[0] if entry else ''
-            if mode == '160000':
-                raise Result(MANIFEST_MISMATCH, f'{path} is a submodule; the runner does not push submodule changes')
-            blob = run_git(repo, 'show', f':{path}', env=env(), index=index, binary=True).stdout
-            if len(blob) > max_mb * 1024 * 1024:
-                raise Result(HOOK_FAILED, f'{path} is larger than {max_mb} MB and cannot be scanned; nothing was committed')
-            if is_archive(blob):
-                raise Result(HOOK_FAILED, f'{path} is a compressed archive, which the scan cannot see inside; nothing was committed')
-            # Each file in its own numbered directory: two listed paths can never
-            # land on the same copy (e.g. ".gitleaks.toml" renamed and a real
-            # ".gitleaks.toml.scanned").
+        expected = set()
+        for n, (label, path, blob) in enumerate(items):
+            # Each window in its own directory, under the file's own name (some
+            # rules key on it), config file names renamed.
             parts = [p + '.scanned' if p in CONFIG_NAMES else p for p in path.split('/')]
-            dest = os.path.join(tree, str(n), *parts)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with open(dest, 'wb') as f:
-                f.write(blob)
-        cmd = [binary, 'dir', '--redact', '--no-banner', '--ignore-gitleaks-allow', '--max-decode-depth', '3',
-               '--max-target-megabytes', str(max_mb + 1), '--config', config, '--gitleaks-ignore-path', empty,
+            for k, chunk in enumerate(windows(blob)):
+                dest = os.path.join(tree, str(n), str(k), *parts)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, 'wb') as f:
+                    f.write(header + chunk)
+                expected.add((n, k))
+        cmd = [binary, 'dir', '--no-banner', '--ignore-gitleaks-allow', '--max-decode-depth', '3',
+               '--max-target-megabytes', '1', '--config', config, '--gitleaks-ignore-path', empty,
                '--report-format', 'json', '--report-path', report.name, '--exit-code', '3', tree]
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, 'GITLEAKS_CONFIG': config})
         except FileNotFoundError:
             raise Result(HOOK_FAILED, f'secrets scanner not found ({binary}); nothing was committed')
-        if p.returncode == 0:
-            return
-        if p.returncode == 3:
-            try:
-                findings = json.load(open(report.name))
-            except Exception:
-                findings = []
-            def listed(found):
-                first = os.path.relpath(found or '', tree).split(os.sep)[0]
-                return files[int(first)][1] if first.isdigit() and int(first) < len(files) else found
-            summary = [{'rule': f.get('RuleID'), 'file': listed(f.get('File')), 'line': f.get('StartLine'),
-                        'secret': f.get('Secret'), 'match': f.get('Match')} for f in findings]
-            raise Result(HOOK_FAILED, json.dumps({'secrets_found': summary}))
-        raise Result(HOOK_FAILED, f'secrets scanner failed ({p.returncode}): {p.stderr.strip()[-1000:]}')
+        if p.returncode not in (0, 3):
+            raise Result(HOOK_FAILED, f'secrets scanner failed ({p.returncode}): {p.stderr.strip()[-1000:]}')
+        try:
+            findings = json.load(open(report.name)) if p.returncode == 3 else []
+        except Exception:
+            raise Result(HOOK_FAILED, 'secrets scanner report unreadable; nothing was committed')
+
+        def where(found):
+            rel = os.path.relpath(found or '', tree).split(os.sep)
+            if len(rel) >= 2 and rel[0].isdigit() and rel[1].isdigit() and int(rel[0]) < len(items):
+                return int(rel[0]), int(rel[1])
+            return None, None
+
+        seen, real = set(), []
+        for f in findings:
+            n, k = where(f.get('File'))
+            if f.get('Secret') == canary and f.get('StartLine') == 1:
+                seen.add((n, k))
+                continue
+            secret = f.get('Secret') or ''
+            real.append({'rule': f.get('RuleID'), 'file': items[n][0] if n is not None else f.get('File'),
+                         'secret': secret[:4] + '…' if secret else ''})
+        if real:
+            # One finding per rule and file is enough to act on.
+            uniq = [dict(t) for t in {tuple(sorted(r.items())) for r in real}]
+            raise Result(HOOK_FAILED, json.dumps({'secrets_found': sorted(uniq, key=lambda r: (r['file'], r['rule']))}))
+        missed = sorted(expected - seen)
+        if missed:
+            names = sorted({items[n][0] for n, _ in missed})
+            raise Result(HOOK_FAILED, f'the scan could not read all of {names[:10]} (binary-looking content?); '
+                                      f'nothing was committed')
 
 
 # ---------------------------------------------------------------- main
@@ -433,8 +494,8 @@ def main(argv):
             else:
                 raw = open(args[0]).read() if args and args[0] != '-' else sys.stdin.read()
             m = json.loads(raw)
-        except (OSError, ValueError) as e:
-            raise Result(MANIFEST_MISMATCH, f'invalid manifest: cannot read it as JSON ({e})')
+        except (OSError, ValueError, RecursionError) as e:
+            raise Result(MANIFEST_MISMATCH, f'invalid manifest: cannot read it as JSON ({type(e).__name__})')
         mm = m.get('manifest') if bundle and isinstance(m, dict) else m
         if isinstance(mm, dict) and isinstance(mm.get('task_id'), str):
             result['task_id'] = mm['task_id']
@@ -452,6 +513,8 @@ def main(argv):
             raise Result(MANIFEST_MISMATCH, f'unexpected error: {e}')
     except Result as r:
         result.update(status=r.status, detail=r.detail, commit_sha=r.commit_sha)
+    except Exception as e:  # malformed input the checks didn't name: still one answer
+        result.update(status=MANIFEST_MISMATCH, detail=f'invalid manifest: {type(e).__name__}')
     result['remote_sha'] = out.get('remote_sha')
     log(result['status'], '-', result['detail'][:300])
     print(json.dumps(result))

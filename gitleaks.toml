@@ -5,7 +5,9 @@
 #   vendor/, node_modules/, lock files, images, PDFs ... is still found;
 # - the global value allowlist's first regex is grouped: the default
 #   '(?i)^true|false|null$' allowlists any secret containing "false".
-# Per-rule allowlists and the global placeholder-value allowlist are kept.
+# - the two per-rule path allowlists (github-app-token, github-pat) are removed:
+#   a file named @octokit/auth-token/README.md would otherwise hide GitHub tokens.
+# Per-rule value allowlists and the global placeholder-value allowlist are kept.
 # This file has been auto-generated. Do not edit manually.
 # If you would like to contribute new rules, please use
 # cmd/generate/config/main.go and follow the contributing guidelines
@@ -2021,11 +2023,6 @@ keywords = [
     "ghu_",
     "ghs_",
 ]
-# NOTE: Gitleaks >= v8.21.0 should use [[rules.allowlists] instead.
-[rules.allowlist]
-paths = [
-    '''(^|/)@octokit/auth-token/README\.md$''',
-]
 
 [[rules]]
 id = "github-fine-grained-pat"
@@ -2047,11 +2044,6 @@ description = "Uncovered a GitHub Personal Access Token, potentially leading to 
 regex = '''ghp_[0-9a-zA-Z]{36}'''
 entropy = 3
 keywords = ["ghp_"]
-# NOTE: Gitleaks >= v8.21.0 should use [[rules.allowlists] instead.
-[rules.allowlist]
-paths = [
-    '''(^|/)@octokit/auth-token/README\.md$''',
-]
 
 [[rules]]
 id = "github-refresh-token"

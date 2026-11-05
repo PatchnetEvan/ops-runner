@@ -23,6 +23,7 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import coordinator  # noqa: E402
+import treebuild  # noqa: E402
 
 RUNNER = [sys.executable, os.path.join(ROOT, 'ops_reconcile.py')]
 GITLEAKS = os.environ.get('OPS_GITLEAKS') or shutil.which('gitleaks') or os.path.expanduser('~/go/bin/gitleaks')
@@ -878,11 +879,18 @@ def b09_loop_over_runner_command(w):
         for k, v in w.env().items():
             if k.startswith('OPS_'):
                 f.write(f'{k}={shlex.quote(v)}\n')
-    entry = os.path.join(ROOT, 'deploy', 'ssh-entry.sh')
+    # The real entry script, with its env file path pointed at the test's.
+    entry = os.path.join(w.tmp, 'ssh-entry.sh')
+    with open(os.path.join(ROOT, 'deploy', 'ssh-entry.sh')) as f:
+        script = f.read()
+    assert script.count('/etc/ops-runner/env') == 1
+    with open(entry, 'w') as f:
+        f.write(script.replace('/etc/ops-runner/env', envfile).replace('"$(dirname "$0")/../ops_reconcile.py"',
+                                                                       shlex.quote(os.path.join(ROOT, 'ops_reconcile.py'))))
     m = w.chunk()
     w.land_other()
     statuses = []
-    e = {**w.env(), 'OPS_RUNNER_CMD': f'sh {shlex.quote(entry)}', 'OPS_ENV_FILE': envfile,
+    e = {**w.env(), 'OPS_RUNNER_CMD': f'sh {shlex.quote(entry)}',
          'SSH_ORIGINAL_COMMAND': 'rm -rf /'}  # what an SSH client asked for; ignored
 
     def run(mm):
@@ -951,6 +959,116 @@ def c01_credential_helper(w):
            'C1 a failure gives no credential and leaks neither key nor JWT', p.stderr.strip())
     finally:
         srv.shutdown()
+
+
+
+# ---------------------------------------------------------------- bundle review
+
+FAKE_GHP = 'ghp_' + 'Xq7Lm2Pz9Rt4Wv8Ks3Nd6Fb1Hj5Gc0Ya2UeT'
+
+
+def bundle_with(w, task, contents, mode='100644', **commit):
+    """A bundle adding these {path: bytes}, built by hand (as a hostile caller could)."""
+    m = w.chunk(task=task, edits={})
+    scratch, env = treebuild.scratch_repo_for(w.wt)
+    try:
+        files = sorted(('A', p) for p in contents)
+        blobs = {p: (mode, b) for p, b in contents.items()}
+        tree, _, _, cleanup = treebuild.build_tree_from_blobs(scratch, m['base_sha'], files, blobs, env=env)
+        cleanup()
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    man = {k: v for k, v in m.items() if k != 'worktree'}
+    man.update(task_id=task, tree_sha=tree, files_changed=[{'path': p, 'status': 'A'} for p in contents])
+    man['commit'] = {**man['commit'], **commit}
+    return {'manifest': man, 'blobs': {p: {'mode': mode, 'data': base64.b64encode(b).decode()} for p, b in contents.items()}}
+
+
+@case
+def r01_scan_reads_everything(w):
+    key = f'aws_access_key_id = "{FAKE_AWS}"\n'.encode()
+    hostile = {
+        'a PDF prefix': b'%PDF-1.4\n' + key,
+        'an RTF prefix': b'{\\rtf1\\ansi ' + key,
+        'a PostScript prefix': b'%!PS\n' + key,
+        'binary magic at the start of the second 10 KB': b'#' * 9999 + b'\n%!x\n' + key,
+        'a key across the 10 KB boundary': b'#' * (10000 - 24) + key,
+        'a key across one of our window edges': b'#' * (8000 - 20) + key,
+        'a key far into a large file': b'x = 1\n' * 200000 + key,
+    }
+    for name, data in hostile.items():
+        r = w.run_bundle(bundle_with(w, 'chunk_r01', {'data/file.txt': data}))
+        ok(r['status'] == 'HOOK_FAILED', f'R1 {name}: the key is found', (r['status'], r['detail'][:100]))
+    r = w.run_bundle(bundle_with(w, 'chunk_r01', {'bin/link': b'%PDF-' + FAKE_AWS.encode()}, mode='120000'))
+    ok(r['status'] == 'HOOK_FAILED', 'R1 a symlink target with a PDF prefix: the key is found', r['status'])
+    # No false refusals: binary-looking content with no secret is still scanned and passes.
+    r = w.run_bundle(bundle_with(w, 'chunk_r01b', {'docs/a.pdf': b'%PDF-1.4\n' + bytes(range(256)) * 200}))
+    ok(r['status'] == 'PUSHED', 'R1 a PDF-like file with no secret: PUSHED (every window read)', (r['status'], r['detail'][:150]))
+    ok(w.commits_with('chunk_r01') == 0, 'R1 nothing with a key was pushed')
+
+
+@case
+def r02_size_limit_matches_the_scan(w):
+    big = b'a' * 1_000_001
+    r = w.run_bundle(bundle_with(w, 'chunk_r02', {'data/big.txt': big}), OPS_SCAN_MAX_MB='1')
+    ok(r['status'] == 'HOOK_FAILED' and 'larger than' in r['detail'], 'R2 one byte over OPS_SCAN_MAX_MB (decimal MB): refused', r['detail'][:100])
+    near = b'a\n' * 499_000 + f'aws_access_key_id = "{FAKE_AWS}"\n'.encode()
+    r = w.run_bundle(bundle_with(w, 'chunk_r02', {'data/near.txt': near}), OPS_SCAN_MAX_MB='1')
+    ok(r['status'] == 'HOOK_FAILED' and 'secrets_found' in r['detail'], 'R2 just under the limit: scanned to the end', r['detail'][:100])
+
+
+@case
+def r03_commit_text_is_scanned(w):
+    b = bundle_with(w, 'chunk_r03', {'src/ok.py': b'X = 1\n'}, body=f'why\naws_access_key_id = "{FAKE_AWS}"\n')
+    r = w.run_bundle(b)
+    ok(r['status'] == 'HOOK_FAILED' and 'commit message' in r['detail'], 'R3 a key in the commit body: HOOK_FAILED', r['detail'][:150])
+    b = bundle_with(w, FAKE_GHP, {'src/ok.py': b'X = 1\n'})
+    r = w.run_bundle(b)
+    ok(r['status'] == 'HOOK_FAILED', 'R3 a token-shaped Task-Id: HOOK_FAILED', r['detail'][:150])
+    ok(w.commits_with(FAKE_GHP) == 0 and w.commits_with('chunk_r03') == 0, 'R3 nothing pushed')
+
+
+@case
+def r04_deep_json_still_answers(w):
+    for raw in (b'[' * 100000, b'{"manifest":' + b'[' * 100000, b'{"manifest": 5, "blobs": {}}', b'"x"'):
+        r = w.run_bundle(raw)
+        ok(r['status'] == 'MANIFEST_MISMATCH' and r['_stdout_lines'] == 1, f'R4 {raw[:16]!r}...: one JSON answer', r['_stderr'][-200:])
+
+
+@case
+def r05_dotgit_lookalikes(w):
+    for p in ('.g‌it/hooks/post-checkout', 'x/.gi‍t/config', 'GIT~1/hooks/x', '.git./config'):
+        b = bundle_with(w, 'chunk_r05', {'src/ok.py': b'X = 1\n'})
+        b['manifest']['files_changed'].append({'path': p, 'status': 'A'})
+        b['blobs'][p] = {'mode': '100755', 'data': base64.b64encode(b'#!/bin/sh\n').decode()}
+        r = w.run_bundle(b)
+        ok(r['status'] == 'MANIFEST_MISMATCH', f'R5 {p!r} refused', r['detail'][:120])
+    ok(w.commits_with('chunk_r05') == 0, 'R5 nothing pushed')
+
+
+@case
+def r06_file_count_cap(w):
+    contents = {f'gen/f{i}.txt': f'{i}\n'.encode() for i in range(1000)}
+    b = bundle_with(w, 'chunk_r06', contents)
+    t = time.time()
+    r = w.run_bundle(b, OPS_MAX_FILES='999')
+    ok(r['status'] == 'MANIFEST_MISMATCH' and 'most a chunk may change' in r['detail'] and time.time() - t < 5,
+       'R6 over OPS_MAX_FILES: refused before any git work', r['detail'][:100])
+    t = time.time()
+    r = w.run_bundle(b)
+    ok(r['status'] == 'PUSHED', f'R6 1,000 files under the cap: PUSHED in {time.time() - t:.1f} s', r['detail'][:100])
+
+
+@case
+def r07_private_key_and_octokit_path(w):
+    pem = b'-----BEGIN RSA PRIVATE KEY-----\n' + b'A' * 64 + b'\n' + b'-----END RSA PRIVATE KEY-----\n'
+    r = w.run_bundle(bundle_with(w, 'chunk_r07', {'keys/deploy.pem': pem}))
+    ok(r['status'] == 'HOOK_FAILED' and 'private-key' in r['detail'], 'R7 a private key block: refused', r['detail'][:100])
+    big = b'-----BEGIN PRIVATE KEY-----\n' + b'B' * 9000 + b'\n-----END PRIVATE KEY-----\n'
+    r = w.run_bundle(bundle_with(w, 'chunk_r07', {'keys/huge.pem': big}))
+    ok(r['status'] == 'HOOK_FAILED', 'R7 a key block longer than a scan window: refused', r['status'])
+    r = w.run_bundle(bundle_with(w, 'chunk_r07', {'node_modules/@octokit/auth-token/README.md': f'{FAKE_GHP}\n'.encode()}))
+    ok(r['status'] == 'HOOK_FAILED', 'R7 a GitHub token in a file named @octokit/auth-token/README.md: found', r['status'])
 
 
 print(f'\n{passed} passed, {failed} failed')

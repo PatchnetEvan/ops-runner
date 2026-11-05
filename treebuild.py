@@ -14,6 +14,7 @@ bytes give the same tree_sha.
 """
 
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -27,6 +28,9 @@ SAFE_CONFIG = [
     '-c', 'protocol.ext.allow=never', '-c', 'trailer.separators=:', '-c', 'status.renames=false',
     '-c', 'diff.renames=false', '-c', 'diff.external=', '-c', 'core.quotePath=false',
     '-c', f'core.attributesFile={os.devnull}',
+    # Refuse .git look-alikes that HFS+ or NTFS would treat as .git (git only
+    # checks these by default on those systems).
+    '-c', 'core.protectHFS=true', '-c', 'core.protectNTFS=true',
 ]
 # No .gitattributes from the worktree applies (no filters, ident, encodings or
 # eol conversion): the bytes hashed are the bytes on disk. Our own git-dir's
@@ -190,28 +194,44 @@ def build_tree_from_blobs(git_dir, base, files, blobs, env=None):
     index = os.path.join(tmpdir, 'index')
 
     def cleanup():
-        try:
-            os.remove(index)
-        except FileNotFoundError:
-            pass
-        os.rmdir(tmpdir)
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
     try:
         run_git(git_dir, 'read-tree', base, env=env, index=index)
-        for status, path in files:
-            if status == 'D':
-                # mode 0 removes the entry; works without a work tree.
-                run_git(git_dir, 'update-index', '-z', '--index-info', env=env, index=index, binary=True,
-                        input=b'0 ' + b'0' * 40 + b'\t' + path.encode() + b'\0')
-                continue
-            mode, data = blobs[path]
+        adds = [(p, blobs[p]) for s_, p in files if s_ != 'D']
+        for p, (mode, _) in adds:
             if mode not in BLOB_MODES:
-                raise RuntimeError(f'{path}: mode {mode} is not a file or symlink mode')
-            sha = run_git(git_dir, 'hash-object', '-w', '--no-filters', '--stdin', env=env, binary=True,
-                          input=data).stdout.decode().strip()
-            # --cacheinfo checks the path itself: no .git component, no file
-            # where the base has a directory (or the reverse).
-            run_git(git_dir, 'update-index', '--add', '--cacheinfo', f'{mode},{sha},{path}', env=env, index=index)
+                raise RuntimeError(f'{p}: mode {mode} is not a file or symlink mode')
+        # One hash-object for all the bytes (written to private files first),
+        # then --cacheinfo in batches: unlike --index-info, --cacheinfo checks
+        # each path (no .git component, no file where the base has a
+        # directory) and fails instead of skipping or replacing.
+        if adds:
+            bdir = os.path.join(tmpdir, 'blobs')
+            os.mkdir(bdir)
+            names = []
+            for n, (p, (mode, data)) in enumerate(adds):
+                names.append(os.path.join(bdir, str(n)))
+                with open(names[-1], 'wb') as f:
+                    f.write(data)
+            shas = run_git(git_dir, 'hash-object', '-w', '--no-filters', '--stdin-paths', env=env,
+                           input='\n'.join(names) + '\n').stdout.split()
+            for name in names:
+                os.remove(name)
+            os.rmdir(bdir)
+            if len(shas) != len(adds):
+                raise RuntimeError('hash-object did not hash every blob')
+            entries = [f'{mode},{sha},{p}' for (p, (mode, _)), sha in zip(adds, shas)]
+            for i in range(0, len(entries), 200):
+                args = []
+                for e in entries[i:i + 200]:
+                    args += ['--cacheinfo', e]
+                run_git(git_dir, 'update-index', '--add', *args, env=env, index=index)
+        rm = [p for s_, p in files if s_ == 'D']
+        if rm:
+            # mode 0 removes an entry; works without a work tree.
+            run_git(git_dir, 'update-index', '-z', '--index-info', env=env, index=index, binary=True,
+                    input=b''.join(b'0 ' + b'0' * 40 + b'\t' + p.encode() + b'\0' for p in rm))
         diff = run_git(git_dir, 'diff', '--cached', '--name-status', '--no-renames', '-z', base,
                        env=env, index=index).stdout
         parts = [d for d in diff.split('\0') if d != '']

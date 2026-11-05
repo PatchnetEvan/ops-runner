@@ -122,8 +122,8 @@ How bundles are built and checked:
 - **When it's used:** set `OPS_RUNNER_CMD` (for example `ssh -i KEY ops-runner@HOST`) and
   `run_ops` and `land_chunk` send bundles there.
 - **On the runner's machine:** `deploy/ssh-entry.sh` is the SSH forced command. It loads
-  `/etc/ops-runner/env` and runs `ops_reconcile.py --bundle`, ignoring whatever command the
-  client asked for.
+  `/etc/ops-runner/env` (a fixed path the client can't change) and runs
+  `ops_reconcile.py --bundle`, ignoring whatever command the client asked for.
 - **Size:** bundles over `OPS_BUNDLE_MAX_MB` (default 100) are refused.
 
 ### Push credential: the GitHub App helper
@@ -182,8 +182,24 @@ credential.
 ## The secrets scan
 
 gitleaks runs on the **staged contents** of every added or modified file, copied out of the
-private index into an empty directory. That's exactly what will be committed. Nothing in the
-repo can configure the scan:
+private index into an empty directory, and on the **commit message** (with the `Task-Id` and
+branch). That's exactly what will be committed.
+
+**Every byte is read, or nothing is committed.** gitleaks reads files in 10,000-byte chunks
+that don't overlap, and stops reading a file at the first chunk that looks binary (a `%PDF` or
+`%!PS` prefix is enough). So the runner doesn't hand it whole files:
+- **Windows:** each blob is copied as overlapping windows of 8,000 bytes, starting every 4,000
+  bytes. Any match up to 4,000 bytes long lies whole inside one window.
+- **Header and canary:** each window starts with a 1,024-byte header holding a fresh canary key.
+  The header covers every offset file-type sniffing looks at.
+- **Proof of reading:** the canary must be found in every window. If any window wasn't read,
+  for whatever reason, nothing is committed.
+- **Private keys:** a `-----BEGIN … PRIVATE KEY` block is refused outright, since a key block
+  can be longer than a window.
+- **Known limit:** an encoded secret inside a single base64 run longer than 4,000 bytes may not
+  decode in any window. GitHub's own secret scanning is the backstop there.
+
+Nothing in the repo can configure the scan:
 - **Repo config files:** `.gitleaks.toml`, `gitleaks.toml` and `.gitleaksignore` are renamed in
   the copy, so they're scanned as content but never act as config. Each file is copied into
   its own directory, so a renamed copy can't overwrite another file.
@@ -191,9 +207,14 @@ repo can configure the scan:
 - **Config:** the runner's own `gitleaks.toml` is used. It's gitleaks v8.21.2's 195 default
   rules **without the default global path allowlist**. That list would otherwise skip
   `gitleaks.toml`, `go.sum`, `vendor/`, `node_modules/`, lock files, images and PDFs entirely.
-  The `true|false|null` allowlist regex is grouped, so it matches only those exact values.
+  The `true|false|null` allowlist regex is grouped, so it matches only those exact values. The
+  two per-rule path allowlists are removed too: a file named `@octokit/auth-token/README.md`
+  would otherwise hide GitHub tokens.
 - **Encoded secrets:** base64 and similar encodings are decoded, up to 3 levels deep.
-- **Size:** a file larger than `OPS_SCAN_MAX_MB` (default 50) is refused rather than skipped.
+- **Size:** a file larger than `OPS_SCAN_MAX_MB` (default 50, in millions of bytes) is refused
+  rather than skipped.
+- **File count:** a chunk listing more than `OPS_MAX_FILES` paths (default 5,000) is refused
+  before any git work.
 - **Archives:** gzip, zip (including `.docx`, `.xlsx` and `.jar`), bzip2, xz, 7z, zstd, rar and tar
   files are refused, since the scan can't see inside them. Add such files by hand, outside the
   pipeline.
@@ -272,6 +293,17 @@ runner as a subprocess or the coordinator loop.
   - B8: a file changed after verify means no bundle is sent.
   - B9: the coordinator loop works through `OPS_RUNNER_CMD` and the SSH entry script,
     including stale-base recovery.
+- **Bundle review fixes:**
+  - R1: a key behind a PDF, RTF or PostScript prefix, binary magic later in the file, or a
+    key across a 10 KB or window boundary or far into a large file, is found. A PDF-like
+    file with no secret still passes.
+  - R2: the size limit is the scan's limit.
+  - R3: a key in the commit body, or a token-shaped `Task-Id`, is found.
+  - R4: deeply nested JSON still gets one JSON answer.
+  - R5: `.git` look-alikes (HFS-ignored characters, `GIT~1`, `.git.`) are refused.
+  - R6: the file-count cap holds, and 1,000 files stage quickly.
+  - R7: private key blocks are refused, including ones longer than a window. A GitHub token in
+    `@octokit/auth-token/README.md` is found.
 - **Credential helper:**
   - C1: the JWT is signed by the App key and names the App.
   - C1: the token asked for is one repository with `contents: write` only.
@@ -292,7 +324,7 @@ runner as a subprocess or the coordinator loop.
 | `OPS_AUTHOR_NAME`, `OPS_AUTHOR_EMAIL` | `ops-runner` |
 | `OPS_BUNDLE_MAX_MB` | `100`: the largest bundle read from stdin |
 | `OPS_GH_APP_ID`, `OPS_GH_INSTALLATION_ID`, `OPS_GH_APP_KEY`, `OPS_GH_REPO` | the credential helper's App, installation, key path and repository |
-| `OPS_ENV_FILE` | `/etc/ops-runner/env`: the file `deploy/ssh-entry.sh` loads |
+| `OPS_MAX_FILES` | `5000`: the most paths one chunk may list |
 | `OPS_RUNNER_CMD` | coordinator side: the command that reaches the runner's machine; bundles are sent when it is set |
 | `OPS_TEST_PAUSE_FILE` | tests only: makes the runner pause before the push |
 

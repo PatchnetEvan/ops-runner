@@ -5,6 +5,6 @@
 # bundle on stdin and read back one JSON answer.
 set -eu
 set -a
-. "${OPS_ENV_FILE:-/etc/ops-runner/env}"
+. /etc/ops-runner/env
 set +a
 exec python3 "$(dirname "$0")/../ops_reconcile.py" --bundle
