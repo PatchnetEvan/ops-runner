@@ -18,13 +18,16 @@ worktree with the repo's hooks. The review showed what that allows:
 - a hook can rewrite the history under the verified tree;
 - `pushurl` and `url.*.insteadOf` can redirect the push or fake an "already committed";
 - `core.fsmonitor` can run a command during `git status`;
+- `filter.*` with `.gitattributes` can run a command on every file, and change the bytes hashed;
 - `trailer.*` settings can change the trailers.
 
 So the runner never runs git with the worktree's config or hooks:
 - It works in **its own bare repository** (`OPS_REPO`), with no system config, its own
   global config (`OPS_GIT_CONFIG`, where its credential lives) and an empty hooks directory.
 - It builds the tree as **`base_sha`'s tree plus the listed paths, read from the worktree
-  as plain files** (`--work-tree`, with a throwaway index).
+  as plain files** (`--work-tree`, with a throwaway index). No `.gitattributes` applies
+  (`GIT_ATTR_SOURCE` is the empty tree), so no filter, `ident` or line-ending conversion: the
+  bytes hashed are the bytes on disk.
 - It commits with **`commit-tree`**: the verified tree, parent `base_sha`, the runner's
   own message. No hooks run.
 - It pushes **the new commit's SHA** to **`OPS_REMOTE_URL`**, never to a remote name the
@@ -32,8 +35,16 @@ So the runner never runs git with the worktree's config or hooks:
 - It **never modifies the worktree.** On success or failure, `HEAD` stays at `base_sha`
   with the changes uncommitted.
 
-The coordinator computes `tree_sha` the same way, in a scratch repository that borrows the
-worktree's objects, so the same bytes give the same tree.
+The coordinator computes `tree_sha` the same way, in a scratch repository that uses the
+worktree's object store, so the same bytes give the same tree. Its rebase recovery is also
+config-free:
+1. **Fetch** the tip from `OPS_REMOTE_URL` (never the worktree's `origin`).
+2. **Merge** with `git merge-tree` in the scratch repository.
+3. **On a conflict**, leave the worktree untouched and send it back to the worker.
+4. **Otherwise**, write the merged files with a two-tree `read-tree -u`, move `HEAD` with
+   `update-ref` (hooks emptied) and reset the worktree's index to the new base.
+
+No worktree filter, hook or fsmonitor runs at any step.
 
 ## Roles
 
@@ -94,14 +105,17 @@ and hashes the tree. `coordinator.land_chunk(m)` is the retry loop from the spec
    - Worktree `HEAD` ≠ `base_sha` → `MANIFEST_MISMATCH`.
 4. **Stage** `base_sha`'s tree plus the listed paths, in a private index: A and M from disk,
    D removed.
-5. **Nothing stray.** Untracked files or unlisted changes → `MANIFEST_MISMATCH`. The staged
-   set must equal `files_changed`.
+5. **Nothing stray.** Untracked files or unlisted changes → `MANIFEST_MISMATCH`. So is a
+   `.gitignore` or `.gitattributes` that ignores itself. The staged set must equal
+   `files_changed`.
 6. **Tree matches.** `write-tree` must equal `tree_sha`.
 7. **Secrets scan** (see below).
 8. **Commit** with `commit-tree`: parent `base_sha`, subject and body from the manifest, then
    the `Task-Id` and `Verified-Base` trailers.
 9. **Push** `<new commit SHA>:refs/heads/<branch>`, with no force and no `+` refspec.
-   - If it's rejected, or `ls-remote` doesn't show the new commit, return `PUSH_REJECTED`.
+   - `PUSHED` if the push reports the ref updated, or a fresh fetch shows the new commit on
+     the branch (another commit may already be on top of it).
+   - Otherwise `PUSH_REJECTED`.
 10. **Report:** `PUSHED`.
 
 | Status | Coordinator action |
@@ -119,13 +133,18 @@ gitleaks runs on the **staged contents** of every added or modified file, copied
 private index into an empty directory. That's exactly what will be committed. Nothing in the
 repo can configure the scan:
 - **Repo config files:** `.gitleaks.toml`, `gitleaks.toml` and `.gitleaksignore` are renamed in
-  the copy, so they're scanned as content but never act as config.
+  the copy, so they're scanned as content but never act as config. Each file is copied into
+  its own directory, so a renamed copy can't overwrite another file.
 - **Allow comments:** `gitleaks:allow` comments are ignored (`--ignore-gitleaks-allow`).
 - **Config:** the runner's own `gitleaks.toml` is used. It's gitleaks v8.21.2's 195 default
   rules **without the default global path allowlist**. That list would otherwise skip
   `gitleaks.toml`, `go.sum`, `vendor/`, `node_modules/`, lock files, images and PDFs entirely.
+  The `true|false|null` allowlist regex is grouped, so it matches only those exact values.
 - **Encoded secrets:** base64 and similar encodings are decoded, up to 3 levels deep.
 - **Size:** a file larger than `OPS_SCAN_MAX_MB` (default 50) is refused rather than skipped.
+- **Archives:** gzip, zip (including `.docx`, `.xlsx` and `.jar`), bzip2, xz, 7z, zstd, rar and tar
+  files are refused, since the scan can't see inside them. Add such files by hand, outside the
+  pipeline.
 - **Whole files:** whole files are scanned, not just the changed lines.
 - **Submodules:** submodule changes are refused.
 
@@ -141,6 +160,8 @@ A missing scanner fails closed: `HOOK_FAILED`, nothing committed.
 | `ALREADY_COMMITTED` on any commit with the `Task-Id` | Only when tree, parent and `Verified-Base` match too | A `Task-Id` alone can be copied |
 | Default gitleaks config | Default rules without the global path allowlist; decoding on | The allowlist skips whole classes of files |
 | Coordinator recomputes `tree_sha` after verify | Hashes before verify and requires it unchanged after | A verify step could change the code |
+| Coordinator rebases in the worktree | `merge-tree` in a scratch repository, then files written back | `git rebase` in the worktree runs its filters and hooks |
+| (not covered) | Compressed archives refused | The scan can't see inside them |
 | Every push error → `PUSH_REJECTED`, then rebase and retry | Same status; the coordinator alerts if the remote didn't move | Otherwise a server denial loops to the retry cap |
 
 Pin the gitleaks version in the runner's image. The harness was run with v8.21.2.
@@ -172,6 +193,14 @@ runner as a subprocess or the coordinator loop.
   - E15: a verify step that edits the code.
   - E16: a bad lock directory, and an unreadable manifest, still give one JSON answer.
   - E17: a server denial alerts instead of looping.
+  - E19: a renamed config file's scan copy can't collide with a real file.
+  - E20: the `true|false|null` allowlist matches whole values only.
+  - E21: a worktree filter, `ident` or hook never changes or runs on what's pushed.
+  - E22: a `.gitignore` or `.gitattributes` that ignores itself is a stray.
+  - E23: a push that landed is `PUSHED` even if another commit followed it at once.
+  - E24 and E25: the coordinator's rebase runs no worktree filter, hook, fsmonitor or remote,
+    and a conflict leaves the worktree as it was.
+  - E26: gzip and tar files are refused.
 
 ## Environment
 
@@ -187,7 +216,10 @@ runner as a subprocess or the coordinator loop.
 | `OPS_AUTHOR_NAME`, `OPS_AUTHOR_EMAIL` | `ops-runner` |
 | `OPS_TEST_PAUSE_FILE` | tests only: makes the runner pause before the push |
 
-Requires Python 3.9+ and git 2.32+.
+The coordinator reads `OPS_REMOTE_URL` too (or `land_chunk(..., remote_url=...)`). It needs
+read access only.
+
+Requires Python 3.9+ and git 2.38+ (for `merge-tree --write-tree`).
 
 The runner is only a real boundary once it is the only thing that can push: see
 [docs/infrastructure.md](docs/infrastructure.md).

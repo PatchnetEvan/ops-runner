@@ -2,7 +2,9 @@
 # config by tools in this repo's history; see README). Passed with --config,
 # so nothing in the scanned repo can relax it. Differences from the default:
 # - the global path allowlist is removed, so a secret in gitleaks.toml, go.sum,
-#   vendor/, node_modules/, lock files, images, PDFs ... is still found.
+#   vendor/, node_modules/, lock files, images, PDFs ... is still found;
+# - the global value allowlist's first regex is grouped: the default
+#   '(?i)^true|false|null$' allowlists any secret containing "false".
 # Per-rule allowlists and the global placeholder-value allowlist are kept.
 # This file has been auto-generated. Do not edit manually.
 # If you would like to contribute new rules, please use
@@ -19,7 +21,7 @@ title = "ops-runner (gitleaks v8.21.2 default rules, no global path allowlist)"
 [allowlist]
 description = "global allow lists"
 regexes = [
-    '''(?i)^true|false|null$''',
+    '''(?i)^(true|false|null)$''',  # grouped here; the default's ungrouped form skips keys containing "false"
     '''^(?i:a+|b+|c+|d+|e+|f+|g+|h+|i+|j+|k+|l+|m+|n+|o+|p+|q+|r+|s+|t+|u+|v+|w+|x+|y+|z+|\*+|\.+)$''',
     '''^\$(\d+|{\d+})$''',
     '''^\$([A-Z_]+|[a-z_]+)$''',

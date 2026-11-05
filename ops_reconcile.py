@@ -265,13 +265,34 @@ def run(m, out):
 
     # 9. Push that exact SHA: no force, no + refspec.
     pause_for_tests()
-    p = run_git(repo, 'push', '--porcelain', url, f'{new_sha}:refs/heads/{branch}', env=env(), check=False)
-    after = ls_remote(repo, url, branch)
-    out['remote_sha'] = after
-    if p.returncode != 0 or after != new_sha:
-        text = (p.stdout + p.stderr).strip()[-2000:]
-        raise Result(PUSH_REJECTED, f'push of {new_sha} not accepted (remote is at {after}): {text}')
-    raise Result(PUSHED, f'pushed {new_sha} to refs/heads/{branch}', commit_sha=new_sha)
+    ref = f'refs/heads/{branch}'
+    p = run_git(repo, 'push', '--porcelain', url, f'{new_sha}:{ref}', env=env(), check=False)
+    # --porcelain: "<flag>\t<from>:<to>\t<summary>"; ' ' updated, '*' new ref.
+    accepted = p.returncode == 0 and any(
+        len(f) >= 2 and f[0] in (' ', '*') and f[1] == f'{new_sha}:{ref}'
+        for f in (line.split('\t') for line in p.stdout.splitlines()))
+    out['remote_sha'] = ls_remote(repo, url, branch)
+    if accepted or landed(repo, url, branch, tracking, new_sha):
+        raise Result(PUSHED, f'pushed {new_sha} to {ref}', commit_sha=new_sha)
+    text = (p.stdout + p.stderr).strip()[-2000:]
+    raise Result(PUSH_REJECTED, f'push of {new_sha} not accepted (remote is at {out["remote_sha"]}): {text}')
+
+
+def landed(repo, url, branch, tracking, sha):
+    """Whether sha is on the remote branch now, even if the push's answer
+    didn't say so (e.g. another commit landed right after ours)."""
+    if run_git(repo, 'fetch', '--no-tags', '--quiet', url, f'+refs/heads/{branch}:{tracking}', env=env(),
+               check=False).returncode != 0:
+        return False
+    return run_git(repo, 'merge-base', '--is-ancestor', sha, tracking, env=env(), check=False).returncode == 0
+
+
+ARCHIVE_MAGIC = (b'\x1f\x8b', b'PK\x03\x04', b'PK\x05\x06', b'BZh', b'\xfd7zXZ\x00', b'7z\xbc\xaf\x27\x1c',
+                 b'\x28\xb5\x2f\xfd', b'Rar!\x1a\x07')
+
+
+def is_archive(blob):
+    return blob.startswith(ARCHIVE_MAGIC) or blob[257:262] == b'ustar'
 
 
 def pause_for_tests():
@@ -299,7 +320,7 @@ def scan(repo, index, files):
     max_mb = int(os.environ.get('OPS_SCAN_MAX_MB', '50'))
     with tempfile.TemporaryDirectory() as tree, tempfile.TemporaryDirectory() as empty, \
             tempfile.NamedTemporaryFile('r', suffix='.json') as report:
-        for status, path in files:
+        for n, (status, path) in enumerate(files):
             if status == 'D':
                 continue
             entry = run_git(repo, 'ls-files', '-s', '-z', '--', path, env=env(), index=index).stdout.split('\0')[0]
@@ -309,8 +330,13 @@ def scan(repo, index, files):
             blob = run_git(repo, 'show', f':{path}', env=env(), index=index, binary=True).stdout
             if len(blob) > max_mb * 1024 * 1024:
                 raise Result(HOOK_FAILED, f'{path} is larger than {max_mb} MB and cannot be scanned; nothing was committed')
+            if is_archive(blob):
+                raise Result(HOOK_FAILED, f'{path} is a compressed archive, which the scan cannot see inside; nothing was committed')
+            # Each file in its own numbered directory: two listed paths can never
+            # land on the same copy (e.g. ".gitleaks.toml" renamed and a real
+            # ".gitleaks.toml.scanned").
             parts = [p + '.scanned' if p in CONFIG_NAMES else p for p in path.split('/')]
-            dest = os.path.join(tree, *parts)
+            dest = os.path.join(tree, str(n), *parts)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             with open(dest, 'wb') as f:
                 f.write(blob)
@@ -328,10 +354,11 @@ def scan(repo, index, files):
                 findings = json.load(open(report.name))
             except Exception:
                 findings = []
-            summary = [{'rule': f.get('RuleID'),
-                        'file': os.path.relpath(f.get('File', ''), tree).replace('.scanned', ''),
-                        'line': f.get('StartLine'), 'secret': f.get('Secret'), 'match': f.get('Match')}
-                       for f in findings]
+            def listed(found):
+                first = os.path.relpath(found or '', tree).split(os.sep)[0]
+                return files[int(first)][1] if first.isdigit() and int(first) < len(files) else found
+            summary = [{'rule': f.get('RuleID'), 'file': listed(f.get('File')), 'line': f.get('StartLine'),
+                        'secret': f.get('Secret'), 'match': f.get('Match')} for f in findings]
             raise Result(HOOK_FAILED, json.dumps({'secrets_found': summary}))
         raise Result(HOOK_FAILED, f'secrets scanner failed ({p.returncode}): {p.stderr.strip()[-1000:]}')
 

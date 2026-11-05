@@ -25,13 +25,20 @@ SAFE_CONFIG = [
     '-c', 'core.autocrlf=false', '-c', 'core.safecrlf=false', '-c', 'core.symlinks=true',
     '-c', 'protocol.ext.allow=never', '-c', 'trailer.separators=:', '-c', 'status.renames=false',
     '-c', 'diff.renames=false', '-c', 'diff.external=', '-c', 'core.quotePath=false',
+    '-c', f'core.attributesFile={os.devnull}',
 ]
+# No .gitattributes from the worktree applies (no filters, ident, encodings or
+# eol conversion): the bytes hashed are the bytes on disk. Our own git-dir's
+# info/attributes is the only other source, and it is empty.
+EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+CONFIG_FILES = ('.gitignore', '.gitattributes')
 
 
 def isolated_env(global_config=None, extra=None):
     """No system config; a global config the caller chooses (default: none)."""
     env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
     env.update({'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': global_config or os.devnull,
+                'GIT_ATTR_SOURCE': EMPTY_TREE,
                 'GIT_TERMINAL_PROMPT': '0', 'GIT_ASKPASS': '/bin/false', 'SSH_ASKPASS': '/bin/false'})
     if extra:
         env.update(extra)
@@ -93,6 +100,13 @@ def build_tree(git_dir, worktree, base, files, env=None):
                 i += 1
             if x not in 'AMD' or y != ' ':
                 strays.append(f'{x}{y} {p}')
+        # An ignored .gitignore or .gitattributes (one that ignores itself) is
+        # invisible to status but still changes what the tests ran against.
+        ign = run_git(git_dir, 'ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory',
+                      env=env, work_tree=worktree, index=index).stdout
+        for p in ign.split('\0'):
+            if p and os.path.basename(p.rstrip('/')) in CONFIG_FILES:
+                strays.append(f'!! {p}')
         diff = run_git(git_dir, 'diff', '--cached', '--name-status', '--no-renames', '-z', base,
                        env=env, index=index).stdout
         parts = [d for d in diff.split('\0') if d != '']
@@ -104,17 +118,22 @@ def build_tree(git_dir, worktree, base, files, env=None):
         raise
 
 
+def worktree_dirs(worktree):
+    """(git dir, common dir) of the worktree. rev-parse reads paths only."""
+    p = subprocess.run(['git', '-C', worktree, '-c', 'core.fsmonitor=false', 'rev-parse', '--path-format=absolute',
+                        '--git-dir', '--git-common-dir'], capture_output=True, text=True, env=isolated_env(), check=True)
+    gd, common = p.stdout.split('\n')[:2]
+    return gd, common
+
+
 def scratch_repo_for(worktree):
-    """A coordinator-owned bare repo that borrows the worktree's objects
-    (read-only, via alternates) but none of its config or hooks."""
-    common = subprocess.run(['git', '-C', worktree, '-c', 'core.fsmonitor=false', 'rev-parse',
-                             '--path-format=absolute', '--git-common-dir'],
-                            capture_output=True, text=True, env=isolated_env(), check=True).stdout.strip()
+    """A coordinator-owned bare repo (its own config, refs and hooks: none)
+    that reads and writes the worktree's object store directly. Returns
+    (scratch_dir, env): use env for every git call on it."""
+    _, common = worktree_dirs(worktree)
     d = tempfile.mkdtemp(prefix='ops-scratch-')
     subprocess.run(['git', 'init', '-q', '--bare', d], check=True, env=isolated_env(), capture_output=True)
-    with open(os.path.join(d, 'objects', 'info', 'alternates'), 'w') as f:
-        f.write(os.path.join(common, 'objects') + '\n')
-    return d
+    return d, isolated_env(extra={'GIT_OBJECT_DIRECTORY': os.path.join(common, 'objects')})
 
 
 def worktree_head(worktree):

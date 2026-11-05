@@ -39,11 +39,12 @@ For Evan to set up; the coordinator can't change credentials or repo settings.
 - [ ] Set `OPS_REMOTE_URL` to the repository's URL, and `OPS_GIT_CONFIG` to a git config that
       holds the runner's credential helper. Nothing else on the machine should hold it.
 - [ ] Give the runner its own `OPS_REPO` directory (a bare repository it creates).
-- [ ] Python 3.9+, git 2.32+.
+- [ ] Python 3.9+, git 2.38+.
 - [ ] The runner reads the worktree's files, so it needs read access to the worktrees. It
       needs no write access to them.
 - [ ] A lock directory the runner can write: `OPS_LOCK_DIR`, default `/var/lock`.
 - [ ] Run `python3 tests/harness.py` in the image before first use. Every case must pass.
+- [ ] The coordinator's environment sets `OPS_REMOTE_URL` too, with read-only access.
 
 ## Claude Code deny rules (coordinator and workers)
 

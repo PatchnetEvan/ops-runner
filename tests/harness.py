@@ -5,7 +5,7 @@ Each case builds a throwaway bare repo as origin plus a worktree clone, then
 runs the runner (a real subprocess) or the coordinator loop. Cases 1-12 are
 the build spec's acceptance tests; the E cases are guards found while building
 and in the security review (worker-written hooks and git config, the secrets
-scan's blind spots, spoofed Task-Ids, verify that edits code). Run: python3 tests/harness.py   (needs git >= 2.32 and gitleaks)
+scan's blind spots, spoofed Task-Ids, verify that edits code). Run: python3 tests/harness.py   (needs git >= 2.38 and gitleaks)
 
 Environment: OPS_GITLEAKS (default: gitleaks on PATH, else ~/go/bin/gitleaks).
 """
@@ -300,7 +300,7 @@ def t11_loop_rebase_conflict(w):
     w.land_other(path='src/app.py', text='def hello():\n    return "theirs"\n')
     sent = []
     outcome, why = coordinator.land_chunk(m, run_ops=lambda mm: coordinator.run_ops(mm, env=w.env()),
-                                          send_to_worker=lambda mm, d: sent.append(d))
+                                          send_to_worker=lambda mm, d: sent.append(d), remote_url=w.origin)
     ok(outcome == 'worker' and sent and sent[0].startswith('conflict on'), '11 stale base, then a rebase conflict: chunk sent back to the worker', (outcome, why))
     ok(not os.path.exists(os.path.join(w.wt, '.git', 'rebase-merge')) and not os.path.exists(os.path.join(w.wt, '.git', 'rebase-apply')), '11 rebase aborted')
     ok(g(w.wt, 'rev-parse', 'HEAD') == old and 'ours' in open(os.path.join(w.wt, 'src/app.py')).read(), '11 worktree clean on its old base, the change kept uncommitted')
@@ -319,7 +319,7 @@ def t12_loop_rebase_clean(w):
         r = coordinator.run_ops(mm, env=w.env())
         statuses.append(r['status'])
         return r
-    outcome, sha = coordinator.land_chunk(m, run_ops=run)
+    outcome, sha = coordinator.land_chunk(m, run_ops=run, remote_url=w.origin)
     ok(outcome == 'done' and statuses == ['STALE_BASE', 'PUSHED'], '12 stale base, clean rebase, verify passes: PUSHED on the retry', statuses)
     ok(m['base_sha'] == new_base, '12 the new manifest has the rebased-onto SHA')
     ok(m['tree_sha'] != first_tree and g(w.origin, 'rev-parse', f'{sha}^{{tree}}') == m['tree_sha'], '12 and a new tree_sha, which is what was pushed')
@@ -488,7 +488,7 @@ def e15_verify_that_edits_code(w):
         m = ww.chunk(task='chunk_e15b')
         m['verify_cmd'] = verify.replace('src/app.py', 'src/app.py')
         ww.land_other()
-        outcome, why = coordinator.land_chunk(m, run_ops=lambda mm: coordinator.run_ops(mm, env=ww.env()))
+        outcome, why = coordinator.land_chunk(m, run_ops=lambda mm: coordinator.run_ops(mm, env=ww.env()), remote_url=ww.origin)
         ok(outcome == 'worker' and 'changed' in why, 'E15 after a rebase too: sent back, nothing pushed', (outcome, why))
         ok(ww.commits_with('chunk_e15b') == 0, 'E15 nothing pushed')
     finally:
@@ -516,7 +516,7 @@ def e17_push_error_is_not_a_race(w):
         r = coordinator.run_ops(mm, env=w.env())
         calls.append(r['status'])
         return r
-    outcome, why = coordinator.land_chunk(m, run_ops=run)
+    outcome, why = coordinator.land_chunk(m, run_ops=run, remote_url=w.origin)
     ok(outcome == 'push_error' and calls == ['PUSH_REJECTED'], 'E17 a push the server denies: one try, then an alert (no rebase loop)', (outcome, calls))
 
 
@@ -527,6 +527,161 @@ def e18_main_by_another_case(w):
         r = w.run({**m, 'target_branch': b})
         ok(r['status'] == 'MANIFEST_MISMATCH', f'E18 {b!r} refused', r['status'])
 
+
+
+# ---------------------------------------------------------------- second review
+
+@case
+def e19_scan_copy_names_cannot_collide(w):
+    # A renamed config file's copy must not overwrite (or be overwritten by) a
+    # real file with the renamed name.
+    for secret_in in ('cfg/.gitleaks.toml', 'cfg/.gitleaks.toml.scanned'):
+        ww = World()
+        try:
+            other = 'cfg/.gitleaks.toml.scanned' if secret_in == 'cfg/.gitleaks.toml' else 'cfg/.gitleaks.toml'
+            m = ww.chunk(task='chunk_e19', edits={secret_in: f'aws_access_key_id = "{FAKE_AWS}"\n',
+                                                  other: '# nothing here\n'})
+            r = ww.run(m)
+            ok(r['status'] == 'HOOK_FAILED', f'E19 a secret in {secret_in} next to its renamed twin is found', r['status'])
+        finally:
+            ww.close()
+
+
+@case
+def e20_allowlist_regex_is_anchored(w):
+    # The generic rule's allowlist (true|false|null) must match whole values
+    # only, not any secret that contains "false" or starts with "true".
+    for val in ('trueQ7mZ2xV9kL4pR8sT1wY6nB3cF5hJ0', 'Q7mZ2xV9kfalseL4pR8sT1wY6nB3cF5hJ', 'Q7mZ2xV9kL4pR8sT1wY6nB3cF5hJnull'):
+        ww = World()
+        try:
+            m = ww.chunk(task='chunk_e20', edits={'src/settings.py': f'api_key = "{val}"\n'})
+            r = ww.run(m)
+            ok(r['status'] == 'HOOK_FAILED', f'E20 a generic key {val[:12]}... is still found', r['status'])
+        finally:
+            ww.close()
+
+
+def hostile_config(w, marks):
+    """Worker-written worktree git config and attributes that would run
+    commands if anything ran git with them. Each command touches a marker."""
+    m1, m2, m3, m4 = marks
+    for k, v in (('core.fsmonitor', f'touch {m1}; false'),
+                 ('filter.evil.clean', f'touch {m2}; sed s/hello/EVIL/'),
+                 ('filter.evil.smudge', f'touch {m2}; cat'), ('filter.evil.required', 'true'),
+                 ('remote.origin.url', '/nonexistent/repo.git'), ('core.hooksPath', '.git/hooks')):
+        g(w.wt, 'config', k, v)
+    with open(os.path.join(w.wt, '.git', 'info', 'attributes'), 'w') as f:
+        f.write('* filter=evil\n')
+    for h in ('post-checkout', 'post-merge', 'post-rewrite', 'reference-transaction', 'pre-commit',
+              'pre-auto-gc', 'post-index-change'):
+        w.hook(os.path.join(w.wt, '.git'), h, f'touch {m3}\n')
+    with open(os.path.join(w.wt, '.git', 'config'), 'a') as f:
+        f.write(f'[core]\n\tpager = touch {m4}\n')
+
+
+@case
+def e21_worktree_attributes_do_not_apply(w):
+    marks = [os.path.join(w.tmp, f'mark{i}') for i in range(4)]
+    # A listed .gitattributes asks for the filter too.
+    m = w.chunk(edits={'.gitattributes': '* filter=evil\n*.py ident\n',
+                       'src/app.py': 'def hello():\n    return "hello $Id$"\n'})
+    hostile_config(w, marks)
+    r = w.run(m)
+    ok(r['status'] == 'PUSHED', 'E21 a listed .gitattributes with a filter: pushed', r)
+    blob = g(w.origin, 'show', f'{r.get("commit_sha")}:src/app.py') if r['status'] == 'PUSHED' else ''
+    ok('hello $Id$' in blob and 'EVIL' not in blob, 'E21 the pushed bytes are the bytes on disk (no filter, no ident)', blob)
+    ok(not any(os.path.exists(x) for x in marks), 'E21 no worktree filter, hook or fsmonitor ran')
+
+
+@case
+def e22_self_ignoring_config_files_are_strays(w):
+    for name in ('.gitignore', 'src/.gitattributes'):
+        ww = World()
+        try:
+            m = ww.chunk(task='chunk_e22')
+            ww.write(ww.wt, name, f'{os.path.basename(name)}\n')
+            r = ww.run(m)
+            ok(r['status'] == 'MANIFEST_MISMATCH' and os.path.basename(name) in r['detail'],
+               f'E22 an unlisted {name} that ignores itself: MANIFEST_MISMATCH', r)
+        finally:
+            ww.close()
+
+
+@case
+def e23_push_landed_then_branch_moved(w):
+    # A post-receive hook lands another commit right after ours: the remote
+    # tip is not ours, but ours is on the branch, so it's PUSHED.
+    m = w.chunk()
+    w.hook(w.origin, 'post-receive', f"""read old new ref
+export GIT_AUTHOR_NAME=x GIT_AUTHOR_EMAIL=x@x GIT_COMMITTER_NAME=x GIT_COMMITTER_EMAIL=x@x
+c=$(git commit-tree "$new^{{tree}}" -p "$new" -m follow-up)
+git update-ref {"refs/heads/" + BRANCH} "$c" "$new" 2>>{w.tmp}/hook.err
+""")
+    r = w.run(m)
+    ok(r['status'] == 'PUSHED' and r.get('remote_sha') != r.get('commit_sha'),
+       'E23 our commit landed and another followed: PUSHED, not PUSH_REJECTED', (r, open(os.path.join(w.tmp, 'hook.err')).read() if os.path.exists(os.path.join(w.tmp, 'hook.err')) else ''))
+    ok(w.commits_with('chunk_04_auth_endpoints') == 1, 'E23 exactly one commit for the task')
+
+
+@case
+def e24_rebase_never_runs_worktree_git(w):
+    marks = [os.path.join(w.tmp, f'mark{i}') for i in range(4)]
+    m = w.chunk()
+    hostile_config(w, marks)
+    w.land_other()
+    new_base = w.tip()
+    statuses = []
+
+    def run(mm):
+        r = coordinator.run_ops(mm, env=w.env())
+        statuses.append(r['status'])
+        return r
+    outcome, sha = coordinator.land_chunk(m, run_ops=run, remote_url=w.origin)
+    ok(outcome == 'done' and statuses == ['STALE_BASE', 'PUSHED'], 'E24 rebase recovery with hostile worktree config: PUSHED', (outcome, statuses))
+    ok(not any(os.path.exists(x) for x in marks), 'E24 no worktree filter, hook, fsmonitor or pager ran',
+       [x for x in marks if os.path.exists(x)])
+    ok(coordinator.head(w.wt) == new_base and m['base_sha'] == new_base, 'E24 HEAD moved to the fetched tip')
+    on_disk = open(os.path.join(w.wt, 'src/other.py')).read() if os.path.exists(os.path.join(w.wt, 'src/other.py')) else ''
+    ok(on_disk == 'OTHER = 2\n' and 'hello' in open(os.path.join(w.wt, 'src/app.py')).read(),
+       'E24 the worktree has the other commit and the chunk')
+
+
+@case
+def e25_rebase_conflict_leaves_worktree_untouched(w):
+    m = w.chunk(edits={'src/app.py': 'def hello():\n    return "ours"\n', 'src/new.py': 'N = 1\n'})
+    before = {p: open(os.path.join(w.wt, p)).read() for p in ('src/app.py', 'src/new.py')}
+    old = m['base_sha']
+    w.land_other(path='src/app.py', text='def hello():\n    return "theirs"\n')
+    why = coordinator.rebase_worktree(m, coordinator.fetch_tip(m, w.origin))
+    ok(why and why.startswith('conflict on') and 'src/app.py' in why, 'E25 conflict names the file', why)
+    after = {p: open(os.path.join(w.wt, p)).read() for p in before}
+    ok(after == before and coordinator.head(w.wt) == old, 'E25 files and HEAD unchanged')
+
+
+@case
+def e26_compressed_archive_refused(w):
+    import gzip
+    import io
+    import tarfile
+    raw = f'aws_access_key_id = "{FAKE_AWS}"\n'.encode()
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w') as t:
+        ti = tarfile.TarInfo('keys.txt')
+        ti.size = len(raw)
+        t.addfile(ti, io.BytesIO(raw))
+    for path, data in (('data/keys.gz', gzip.compress(raw)), ('data/keys.tar', buf.getvalue())):
+        ww = World()
+        try:
+            full = os.path.join(ww.wt, path)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, 'wb') as f:
+                f.write(data)
+            m = coordinator.manifest('chunk_e26', ww.wt, BRANCH, [{'path': path, 'status': 'A'}], 'true',
+                                     {'type': 'feat', 'scope': 'x', 'summary': 'add data', 'body': 'b'})
+            r = ww.run(m)
+            ok(r['status'] == 'HOOK_FAILED' and 'archive' in r['detail'], f'E26 {path} refused (the scan cannot see inside)', r)
+        finally:
+            ww.close()
 
 print(f'\n{passed} passed, {failed} failed')
 sys.exit(1 if failed else 0)
