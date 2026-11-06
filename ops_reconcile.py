@@ -6,6 +6,7 @@ stash, no file edits, no tests.
 
 Usage:
     ops_reconcile.py MANIFEST.json      # or the manifest on stdin
+    ops_reconcile.py --bundle           # a bundle on stdin (see below)
 Prints exactly one JSON object to stdout. Exit 0 for PUSHED and
 ALREADY_COMMITTED, 1 for everything else. Logs go to stderr.
 
@@ -16,6 +17,14 @@ repository (OPS_REPO), reads the worktree's files as plain data, commits with
 commit-tree (no hooks), and pushes to the URL it was configured with
 (OPS_REMOTE_URL), never to a remote the worktree names. The worktree itself is
 left exactly as it was.
+
+Bundle mode (--bundle) is for a runner on its own machine. Stdin holds
+    {"manifest": {...}, "blobs": {"<path>": {"mode": "100644", "data": "<base64>"}}}
+with one blob for every listed A or M path and none other; "worktree" is not
+needed. The runner never reads a worktree: it hashes those bytes straight into
+its own repository, so no worker can change them mid-run, and no worktree
+config, attribute, filter, hook or planted repository takes part. Modes are
+100644, 100755 (executable) or 120000 (a symlink; data is its target).
 
 Checks run in this order, and the first failure returns:
   1. validate the manifest, take a lock per target branch
@@ -41,13 +50,17 @@ Environment:
   OPS_GITLEAKS_CONFIG   gitleaks config (default gitleaks.toml next to this file)
   OPS_SCAN_MAX_MB       largest file the scan reads (default 50); bigger = refused
   OPS_AUTHOR_NAME/EMAIL the commit identity (default "ops-runner")
+  OPS_BUNDLE_MAX_MB     largest bundle read from stdin (default 100)
 """
 
+import base64
+import binascii
 import fcntl
 import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -89,13 +102,14 @@ class Result(Exception):
 
 # ---------------------------------------------------------------- 1. validate
 
-def validate(m):
+def validate(m, bundle=False):
     def bad(why):
         raise Result(MANIFEST_MISMATCH, f'invalid manifest: {why}')
 
     if not isinstance(m, dict):
         bad('not an object')
-    for k in ('task_id', 'worktree', 'base_sha', 'target_branch', 'files_changed', 'tree_sha', 'commit'):
+    for k in ('task_id', 'base_sha', 'target_branch', 'files_changed', 'tree_sha', 'commit') + \
+            (() if bundle else ('worktree',)):
         if k not in m:
             bad(f'missing {k}')
     if not isinstance(m['task_id'], str) or not TASK_RE.match(m['task_id']):
@@ -108,14 +122,19 @@ def validate(m):
         bad('target_branch is not an acceptable branch name')
     if b.lower() in PROTECTED:
         bad('the runner never pushes to main')
-    wt = m['worktree']
-    if not isinstance(wt, str) or not os.path.isabs(wt) or not os.path.isdir(wt):
-        bad('worktree must be an existing absolute directory')
-    wt = os.path.realpath(wt)
+    wt = None
+    if not bundle:
+        wt = m['worktree']
+        if not isinstance(wt, str) or not os.path.isabs(wt) or not os.path.isdir(wt):
+            bad('worktree must be an existing absolute directory')
+        wt = os.path.realpath(wt)
 
     files = m['files_changed']
     if not isinstance(files, list) or not files:
         bad('files_changed must be a non-empty list')
+    max_files = int(os.environ.get('OPS_MAX_FILES', '5000'))
+    if len(files) > max_files:
+        bad(f'files_changed lists {len(files)} paths; the most a chunk may change is {max_files}')
     seen, norm = set(), []
     for f in files:
         if not isinstance(f, dict) or set(f) != {'path', 'status'}:
@@ -129,9 +148,10 @@ def validate(m):
         parts = path.split('/')
         if any(p in ('', '.', '..') for p in parts) or any(p.lower() == '.git' for p in parts):
             bad(f'path {path!r} must stay inside the worktree')
-        full = os.path.realpath(os.path.join(wt, path))
-        if not full.startswith(wt + os.sep):
-            bad(f'path {path!r} resolves outside the worktree')
+        if not bundle:
+            full = os.path.realpath(os.path.join(wt, path))
+            if not full.startswith(wt + os.sep):
+                bad(f'path {path!r} resolves outside the worktree')
         if path in seen:
             bad(f'path {path!r} listed twice')
         seen.add(path)
@@ -155,6 +175,36 @@ def validate(m):
         bad('commit text must not carry Task-Id or Verified-Base lines; the runner adds them')
 
     return {**m, 'worktree': wt, 'files': sorted(norm, key=lambda x: x[1])}
+
+
+def read_bundle(raw):
+    """Split a bundle into its manifest and {path: (mode, bytes)}. The blobs
+    must be exactly the listed A and M paths."""
+    def bad(why):
+        raise Result(MANIFEST_MISMATCH, f'invalid bundle: {why}')
+
+    if not isinstance(raw, dict) or set(raw) != {'manifest', 'blobs'}:
+        bad('expected {"manifest": ..., "blobs": ...}')
+    m = validate(raw['manifest'], bundle=True)
+    given = raw['blobs']
+    if not isinstance(given, dict):
+        bad('blobs must be an object')
+    want = {p for s, p in m['files'] if s != 'D'}
+    if set(given) != want:
+        missing, extra = sorted(want - set(given)), sorted(set(given) - want)
+        bad(f'blobs must be exactly the listed A and M paths (missing {missing[:10]}, unlisted {extra[:10]})')
+    blobs = {}
+    for path, b in given.items():
+        if not isinstance(b, dict) or set(b) != {'mode', 'data'}:
+            bad(f'{path}: each blob is {{mode, data}}')
+        if b['mode'] not in treebuild.BLOB_MODES:
+            bad(f'{path}: mode must be one of {", ".join(treebuild.BLOB_MODES)}')
+        try:
+            data = base64.b64decode(b['data'], validate=True)
+        except (binascii.Error, TypeError, ValueError):
+            bad(f'{path}: data is not base64')
+        blobs[path] = (b['mode'], data)
+    return m, blobs
 
 
 def lock(branch):
@@ -201,7 +251,7 @@ def ls_remote(repo, url, branch):
 
 # ---------------------------------------------------------------- the run
 
-def run(m, out):
+def run(m, out, blobs=None):
     repo, url = ops_repo(), remote_url()
     wt, branch, base, task, tree_sha = m['worktree'], m['target_branch'], m['base_sha'], m['task_id'], m['tree_sha']
     tracking = 'refs/ops/' + hashlib.sha256(url.encode()).hexdigest()[:16] + '/' + branch
@@ -224,16 +274,22 @@ def run(m, out):
         raise Result(MANIFEST_MISMATCH, f'Task-Id {task} is already used on {branch} by {sha}, '
                                         f'which is not this chunk (tree, parent or Verified-Base differ)')
 
-    # 3. Stale base? Remote first, then the worktree.
+    # 3. Stale base? Remote first, then the worktree (bundle mode has none).
     if tip != base:
         raise Result(STALE_BASE, f'remote tip {tip} is not base_sha {base}')
-    head = treebuild.worktree_head(wt)
-    if head != base:
-        raise Result(MANIFEST_MISMATCH, f'worktree HEAD {head} is not base_sha {base}')
+    if blobs is None:
+        head = treebuild.worktree_head(wt)
+        if head != base:
+            raise Result(MANIFEST_MISMATCH, f'worktree HEAD {head} is not base_sha {base}')
 
     # 4-6. Stage base + the listed paths in a private index; no strays; tree matches.
     try:
-        tree, strays, staged, index, cleanup = treebuild.build_tree(repo, wt, base, m['files'], env=env())
+        if blobs is None:
+            tree, strays, staged, index, cleanup = treebuild.build_tree(repo, wt, base, m['files'], env=env())
+        else:
+            # Only the listed paths exist in a bundle: nothing can be stray.
+            tree, staged, index, cleanup = treebuild.build_tree_from_blobs(repo, base, m['files'], blobs, env=env())
+            strays = []
     except RuntimeError as e:
         raise Result(MANIFEST_MISMATCH, f'cannot stage the listed paths: {e}')
     try:
@@ -245,14 +301,12 @@ def run(m, out):
             raise Result(MANIFEST_MISMATCH, f'staged tree {tree} is not tree_sha {tree_sha}')
 
         # 7. Secrets scan of exactly the staged contents.
-        scan(repo, index, m['files'])
+        scan(repo, index, m['files'], commit_message(m) + f"\nBranch: {branch}\n")
     finally:
         cleanup()
 
     # 8. Commit: the verified tree on base_sha, with the runner's own message.
-    c = m['commit']
-    subject = f"{c['type']}({c['scope']}): {c['summary']}" if c.get('scope') else f"{c['type']}: {c['summary']}"
-    message = f"{subject}\n\n{c['body'].strip()}\n\nTask-Id: {task}\nVerified-Base: {base}\n"
+    message = commit_message(m)
     ident = {'GIT_AUTHOR_NAME': os.environ.get('OPS_AUTHOR_NAME', 'ops-runner'),
              'GIT_AUTHOR_EMAIL': os.environ.get('OPS_AUTHOR_EMAIL', 'ops-runner@localhost'),
              'GIT_COMMITTER_NAME': os.environ.get('OPS_AUTHOR_NAME', 'ops-runner'),
@@ -308,59 +362,145 @@ def pause_for_tests():
         time.sleep(0.05)
 
 
-def scan(repo, index, files):
+def commit_message(m):
+    c = m['commit']
+    subject = f"{c['type']}({c['scope']}): {c['summary']}" if c.get('scope') else f"{c['type']}: {c['summary']}"
+    return f"{subject}\n\n{c['body'].strip()}\n\nTask-Id: {m['task_id']}\nVerified-Base: {m['base_sha']}\n"
+
+
+# gitleaks reads a file in 10,000-byte chunks that don't overlap, and stops
+# reading a file at the first chunk that looks binary. So each blob is scanned
+# as overlapping windows that gitleaks reads in one piece: a 1,024-byte header,
+# then WINDOW bytes of the blob, starting every STEP bytes. Any match up to
+# STEP bytes long lies whole inside some window. The header holds a canary key
+# and fills every offset file-type sniffing looks at; the canary must be found
+# in every window, or that window wasn't read and nothing is committed.
+WINDOW, STEP, HEADER = 8000, 4000, 1024
+PRIVATE_KEY = re.compile(rb'-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY')
+
+
+def _b64_markers(word):
+    """The base64 text that encodes `word` at each of the three byte
+    alignments, trimmed to the characters that depend only on `word`."""
+    out = []
+    for pad in range(3):
+        a = base64.b64encode(b'A' * pad + word + b'AAA').decode()
+        b = base64.b64encode(b'z' * pad + word + b'zzz').decode()
+        common = ''.join(x if x == y else '\0' for x, y in zip(a, b))
+        run = max(common.split('\0'), key=len)
+        out += [run, run.replace('+', '-').replace('/', '_')]
+    return sorted(set(out))
+
+
+# A key block can be longer than a scan window once encoded (base64 of a
+# 4096-bit PEM is ~4,400 bytes), and gitleaks 8.21.2 decodes only base64. So the
+# runner looks for the words "PRIVATE KEY" itself: raw, URL-encoded, hex, and
+# base64 at every alignment. Matching the words (not "-----BEGIN") keeps
+# base64 certificates, e.g. in a kubeconfig, from being refused.
+B64_PRIVATE_KEY = re.compile('|'.join(re.escape(m) for m in _b64_markers(b'PRIVATE KEY')).encode())
+TEXT_PRIVATE_KEY = re.compile(rb'PRIVATE(?:%20|\+|\\x20|\\u0020|&#32;|&#x20;)KEY|' + b'PRIVATE KEY'.hex().encode(),
+                              re.IGNORECASE)
+
+
+def private_key_in(blob):
+    return bool(PRIVATE_KEY.search(blob) or B64_PRIVATE_KEY.search(blob) or TEXT_PRIVATE_KEY.search(blob))
+
+
+def windows(blob):
+    if len(blob) <= WINDOW:
+        return [blob]
+    return [blob[o:o + WINDOW] for o in range(0, len(blob) - WINDOW + STEP, STEP)]
+
+
+def window_header(canary):
+    first = f'ops_scan_canary = "{canary}"\n'.encode()
+    pad = HEADER - len(first) - 1
+    return first + (b'#' * 79 + b'\n') * (pad // 80) + b'#' * (pad % 80) + b'\n'
+
+
+def scan(repo, index, files, message):
     """Scan exactly what will be committed: the staged blob of every added or
-    modified file, copied into an empty directory, with the runner's own
-    config. Nothing in the repo can configure the scan: config and ignore
-    files are renamed in the copy (still scanned as content), gitleaks:allow
-    comments are ignored, encoded secrets are decoded, and a file too large
-    to scan is refused rather than skipped."""
+    modified file, and the commit message, with the runner's own config.
+    Nothing in the repo can configure the scan: config and ignore files are
+    renamed in the copy (still scanned as content), gitleaks:allow comments
+    are ignored, base64 is decoded, a private key is refused outright in any
+    common encoding, and anything gitleaks didn't read (too large, an archive, or a
+    window it took for binary) means nothing is committed."""
     binary = os.environ.get('OPS_GITLEAKS', 'gitleaks')
     config = os.environ.get('OPS_GITLEAKS_CONFIG', os.path.join(HERE, 'gitleaks.toml'))
-    max_mb = int(os.environ.get('OPS_SCAN_MAX_MB', '50'))
+    max_bytes = int(os.environ.get('OPS_SCAN_MAX_MB', '50')) * 1_000_000
+    canary = 'AKIA' + ''.join(secrets.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ234567') for _ in range(16))
+    header = window_header(canary)
+    items = []  # (label, path to name the copy after, bytes)
+    for status, path in files:
+        if status == 'D':
+            continue
+        entry = run_git(repo, 'ls-files', '-s', '-z', '--', path, env=env(), index=index).stdout.split('\0')[0]
+        mode = entry.split(' ')[0] if entry else ''
+        if mode == '160000':
+            raise Result(MANIFEST_MISMATCH, f'{path} is a submodule; the runner does not push submodule changes')
+        blob = run_git(repo, 'show', f':{path}', env=env(), index=index, binary=True).stdout
+        if len(blob) > max_bytes:
+            raise Result(HOOK_FAILED, f'{path} is larger than {max_bytes // 1_000_000} MB and cannot be scanned; nothing was committed')
+        if is_archive(blob):
+            raise Result(HOOK_FAILED, f'{path} is a compressed archive, which the scan cannot see inside; nothing was committed')
+        items.append((path, path, blob))
+    items.append(('the commit message', 'COMMIT_EDITMSG', message.encode()))
+    for label, _, blob in items:
+        if private_key_in(blob):
+            raise Result(HOOK_FAILED, json.dumps({'secrets_found': [{'rule': 'private-key', 'file': label}]}))
+
     with tempfile.TemporaryDirectory() as tree, tempfile.TemporaryDirectory() as empty, \
             tempfile.NamedTemporaryFile('r', suffix='.json') as report:
-        for n, (status, path) in enumerate(files):
-            if status == 'D':
-                continue
-            entry = run_git(repo, 'ls-files', '-s', '-z', '--', path, env=env(), index=index).stdout.split('\0')[0]
-            mode = entry.split(' ')[0] if entry else ''
-            if mode == '160000':
-                raise Result(MANIFEST_MISMATCH, f'{path} is a submodule; the runner does not push submodule changes')
-            blob = run_git(repo, 'show', f':{path}', env=env(), index=index, binary=True).stdout
-            if len(blob) > max_mb * 1024 * 1024:
-                raise Result(HOOK_FAILED, f'{path} is larger than {max_mb} MB and cannot be scanned; nothing was committed')
-            if is_archive(blob):
-                raise Result(HOOK_FAILED, f'{path} is a compressed archive, which the scan cannot see inside; nothing was committed')
-            # Each file in its own numbered directory: two listed paths can never
-            # land on the same copy (e.g. ".gitleaks.toml" renamed and a real
-            # ".gitleaks.toml.scanned").
+        expected = set()
+        for n, (label, path, blob) in enumerate(items):
+            # Each window in its own directory, under the file's own name (some
+            # rules key on it), config file names renamed.
             parts = [p + '.scanned' if p in CONFIG_NAMES else p for p in path.split('/')]
-            dest = os.path.join(tree, str(n), *parts)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with open(dest, 'wb') as f:
-                f.write(blob)
-        cmd = [binary, 'dir', '--redact', '--no-banner', '--ignore-gitleaks-allow', '--max-decode-depth', '3',
-               '--max-target-megabytes', str(max_mb + 1), '--config', config, '--gitleaks-ignore-path', empty,
+            for k, chunk in enumerate(windows(blob)):
+                dest = os.path.join(tree, str(n), str(k), *parts)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, 'wb') as f:
+                    f.write(header + chunk)
+                expected.add((n, k))
+        cmd = [binary, 'dir', '--no-banner', '--ignore-gitleaks-allow', '--max-decode-depth', '3',
+               '--max-target-megabytes', '1', '--config', config, '--gitleaks-ignore-path', empty,
                '--report-format', 'json', '--report-path', report.name, '--exit-code', '3', tree]
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, 'GITLEAKS_CONFIG': config})
         except FileNotFoundError:
             raise Result(HOOK_FAILED, f'secrets scanner not found ({binary}); nothing was committed')
-        if p.returncode == 0:
-            return
-        if p.returncode == 3:
-            try:
-                findings = json.load(open(report.name))
-            except Exception:
-                findings = []
-            def listed(found):
-                first = os.path.relpath(found or '', tree).split(os.sep)[0]
-                return files[int(first)][1] if first.isdigit() and int(first) < len(files) else found
-            summary = [{'rule': f.get('RuleID'), 'file': listed(f.get('File')), 'line': f.get('StartLine'),
-                        'secret': f.get('Secret'), 'match': f.get('Match')} for f in findings]
-            raise Result(HOOK_FAILED, json.dumps({'secrets_found': summary}))
-        raise Result(HOOK_FAILED, f'secrets scanner failed ({p.returncode}): {p.stderr.strip()[-1000:]}')
+        if p.returncode not in (0, 3):
+            raise Result(HOOK_FAILED, f'secrets scanner failed ({p.returncode}): {p.stderr.strip()[-1000:]}')
+        try:
+            findings = json.load(open(report.name)) if p.returncode == 3 else []
+        except Exception:
+            raise Result(HOOK_FAILED, 'secrets scanner report unreadable; nothing was committed')
+
+        def where(found):
+            rel = os.path.relpath(found or '', tree).split(os.sep)
+            if len(rel) >= 2 and rel[0].isdigit() and rel[1].isdigit() and int(rel[0]) < len(items):
+                return int(rel[0]), int(rel[1])
+            return None, None
+
+        seen, real = set(), []
+        for f in findings:
+            n, k = where(f.get('File'))
+            if f.get('Secret') == canary and f.get('StartLine') == 1:
+                seen.add((n, k))
+                continue
+            secret = f.get('Secret') or ''
+            real.append({'rule': f.get('RuleID'), 'file': items[n][0] if n is not None else f.get('File'),
+                         'secret': secret[:4] + '…' if secret else ''})
+        if real:
+            # One finding per rule and file is enough to act on.
+            uniq = [dict(t) for t in {tuple(sorted(r.items())) for r in real}]
+            raise Result(HOOK_FAILED, json.dumps({'secrets_found': sorted(uniq, key=lambda r: (r['file'], r['rule']))}))
+        missed = sorted(expected - seen)
+        if missed:
+            names = sorted({items[n][0] for n, _ in missed})
+            raise Result(HOOK_FAILED, f'the scan could not read all of {names[:10]} (binary-looking content?); '
+                                      f'nothing was committed')
 
 
 # ---------------------------------------------------------------- main
@@ -368,25 +508,40 @@ def scan(repo, index, files):
 def main(argv):
     result = {'task_id': None, 'status': None, 'commit_sha': None, 'remote_ref': None, 'remote_sha': None, 'detail': ''}
     out = {}
+    bundle = '--bundle' in argv[1:]
+    args = [a for a in argv[1:] if a != '--bundle']
+    blobs = None
     try:
         try:
-            raw = open(argv[1]).read() if len(argv) > 1 and argv[1] != '-' else sys.stdin.read()
+            if bundle:
+                limit = int(os.environ.get('OPS_BUNDLE_MAX_MB', '100')) * 1024 * 1024
+                raw = sys.stdin.buffer.read(limit + 1)
+                if len(raw) > limit:
+                    raise Result(MANIFEST_MISMATCH, f'invalid bundle: larger than {limit // 1024 // 1024} MB')
+            else:
+                raw = open(args[0]).read() if args and args[0] != '-' else sys.stdin.read()
             m = json.loads(raw)
-        except (OSError, json.JSONDecodeError) as e:
-            raise Result(MANIFEST_MISMATCH, f'invalid manifest: cannot read it as JSON ({e})')
-        if isinstance(m, dict) and isinstance(m.get('task_id'), str):
-            result['task_id'] = m['task_id']
-        m = validate(m)
+        except (OSError, ValueError, RecursionError) as e:
+            raise Result(MANIFEST_MISMATCH, f'invalid manifest: cannot read it as JSON ({type(e).__name__})')
+        mm = m.get('manifest') if bundle and isinstance(m, dict) else m
+        if isinstance(mm, dict) and isinstance(mm.get('task_id'), str):
+            result['task_id'] = mm['task_id']
+        if bundle:
+            m, blobs = read_bundle(m)
+        else:
+            m = validate(m)
         result['remote_ref'] = f"refs/heads/{m['target_branch']}"
         try:
             lock(m['target_branch'])
-            run(m, out)
+            run(m, out, blobs)
         except Result:
             raise
         except Exception as e:  # anything the checks didn't name
             raise Result(MANIFEST_MISMATCH, f'unexpected error: {e}')
     except Result as r:
         result.update(status=r.status, detail=r.detail, commit_sha=r.commit_sha)
+    except Exception as e:  # malformed input the checks didn't name: still one answer
+        result.update(status=MANIFEST_MISMATCH, detail=f'invalid manifest: {type(e).__name__}')
     result['remote_sha'] = out.get('remote_sha')
     log(result['status'], '-', result['detail'][:300])
     print(json.dumps(result))

@@ -20,8 +20,10 @@ the worktree runs or is read. The remote is the URL the coordinator is given
 (OPS_REMOTE_URL), never the worktree's "origin".
 """
 
+import base64
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -165,10 +167,54 @@ def verified_tree(m):
     return before, None
 
 
-def run_ops(m, runner=None, env=None):
-    """Run the ops runner on manifest m; returns its JSON result."""
-    runner = runner or [sys.executable, os.path.join(HERE, 'ops_reconcile.py')]
-    p = subprocess.run(runner, input=json.dumps(m), capture_output=True, text=True, env=env)
+def make_bundle(m):
+    """The bundle for manifest m: the manifest (without the worktree path) and
+    the bytes of every listed A/M path, read once. The bytes must hash to
+    m['tree_sha'] (what was verified); if a worker changed anything since, this
+    raises ValueError and nothing is sent."""
+    files = files_of(m)
+    blobs = treebuild.read_blobs(m['worktree'], files)
+    scratch, env = treebuild.scratch_repo_for(m['worktree'])
+    try:
+        tree, staged, _, cleanup = treebuild.build_tree_from_blobs(scratch, m['base_sha'], files, blobs, env=env)
+        cleanup()
+    except RuntimeError as e:
+        raise ValueError(f'cannot build the bundle: {e}')
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    if staged != files or tree != m['tree_sha']:
+        raise ValueError(f'the files changed since they were verified: bundle tree {tree} is not tree_sha '
+                         f"{m['tree_sha']}")
+    manifest = {k: v for k, v in m.items() if k != 'worktree'}
+    return {'manifest': manifest,
+            'blobs': {p: {'mode': mode, 'data': base64.b64encode(data).decode()} for p, (mode, data) in blobs.items()}}
+
+
+def runner_command(bundle, env=None):
+    """OPS_RUNNER_CMD (e.g. "ssh -i KEY ops-runner@HOST") reaches a runner on
+    its own machine, whose forced command runs it with --bundle. Unset: the
+    runner next to this file, on this machine."""
+    cmd = (env or os.environ).get('OPS_RUNNER_CMD')
+    if cmd:
+        return shlex.split(cmd)
+    return [sys.executable, os.path.join(HERE, 'ops_reconcile.py')] + (['--bundle'] if bundle else [])
+
+
+def run_ops(m, runner=None, env=None, bundle=None):
+    """Run the ops runner on manifest m; returns its JSON result. bundle
+    (default: on when OPS_RUNNER_CMD is set) sends the manifest and the file
+    bytes instead of a worktree path."""
+    if bundle is None:
+        bundle = bool((env or os.environ).get('OPS_RUNNER_CMD'))
+    if bundle:
+        try:
+            payload = json.dumps(make_bundle(m))
+        except ValueError as e:
+            return {'status': 'MANIFEST_MISMATCH', 'detail': str(e), 'commit_sha': None}
+    else:
+        payload = json.dumps(m)
+    runner = runner or runner_command(bundle, env)
+    p = subprocess.run(runner, input=payload, capture_output=True, text=True, env=env)
     try:
         return json.loads(p.stdout.strip().splitlines()[-1])
     except Exception:

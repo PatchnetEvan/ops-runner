@@ -63,6 +63,7 @@ No worktree filter, hook or fsmonitor runs at any step.
 
 ```bash
 python3 ops_reconcile.py manifest.json      # or the manifest on stdin
+python3 ops_reconcile.py --bundle < bundle.json
 ```
 
 It prints exactly one JSON object on stdout:
@@ -94,6 +95,52 @@ How `files_changed` works:
 
 The coordinator builds a manifest with `coordinator.manifest(...)`, which stages the listed paths
 and hashes the tree. `coordinator.land_chunk(m)` is the retry loop from the spec.
+
+## Bundle mode: the runner on its own machine
+
+In production the runner lives on a machine of its own, where only it holds the push
+credential. It can't read the coordinator's worktrees there, so the coordinator sends each
+chunk as one bundle on stdin:
+
+```json
+{"manifest": {"task_id": "...", "base_sha": "...", "target_branch": "...", "files_changed": [...],
+              "tree_sha": "...", "commit": {...}},
+ "blobs": {"src/routes/auth.py": {"mode": "100644", "data": "<base64 of the file's bytes>"}}}
+```
+
+How bundles are built and checked:
+- **Contents:** one blob for every listed `A` or `M` path and no other. The mode is `100644`,
+  `100755` (executable) or `120000` (a symlink; the data is its target). `worktree` isn't needed.
+- **No worktree at all:** the runner hashes the bytes straight into its own repository
+  (`hash-object --no-filters`, `update-index --cacheinfo`) and never reads a file. No worktree
+  config, attribute, filter, hook or planted repository takes part, and no worker can change
+  the bytes mid-run. That closes the race the worktree-mode check leaves open.
+- **Same checks after that:** the same tree, scan, commit and push checks as worktree mode run
+  on those bytes. Bytes that don't hash to `tree_sha` are refused.
+- **Coordinator side:** `coordinator.make_bundle(m)` reads each listed file once, after verify.
+  It refuses to send anything if those bytes no longer hash to the verified `tree_sha`.
+- **When it's used:** set `OPS_RUNNER_CMD` (for example `ssh -i KEY ops-runner@HOST`) and
+  `run_ops` and `land_chunk` send bundles there.
+- **On the runner's machine:** `deploy/ssh-entry.sh` is the SSH forced command. It loads
+  `/etc/ops-runner/env` (a fixed path the client can't change) and runs
+  `ops_reconcile.py --bundle`, ignoring whatever command the client asked for.
+- **Size:** bundles over `OPS_BUNDLE_MAX_MB` (default 100) are refused.
+
+### Push credential: the GitHub App helper
+
+`gh_app_credential.py` is a git credential helper. On each push it signs a JWT with the
+runner's GitHub App key and exchanges it for a one-hour installation token, limited to one
+repository with `contents: write`. Nothing is cached. Put it in the git config that
+`OPS_GIT_CONFIG` names:
+
+```ini
+[credential "https://github.com"]
+    helper = !python3 /opt/ops-runner/gh_app_credential.py
+```
+
+It needs `OPS_GH_APP_ID`, `OPS_GH_INSTALLATION_ID`, `OPS_GH_APP_KEY` (the `.pem` path) and
+`OPS_GH_REPO`. It signs with the `openssl` command. For any host but `github.com` it gives no
+credential.
 
 ## Order of checks (first failure returns)
 
@@ -135,8 +182,31 @@ and hashes the tree. `coordinator.land_chunk(m)` is the retry loop from the spec
 ## The secrets scan
 
 gitleaks runs on the **staged contents** of every added or modified file, copied out of the
-private index into an empty directory. That's exactly what will be committed. Nothing in the
-repo can configure the scan:
+private index into an empty directory, and on the **commit message** (with the `Task-Id` and
+branch). That's exactly what will be committed.
+
+**Every byte is read, or nothing is committed.** gitleaks reads files in 10,000-byte chunks
+that don't overlap, and stops reading a file at the first chunk that looks binary (a `%PDF` or
+`%!PS` prefix is enough). So the runner doesn't hand it whole files:
+- **Windows:** each blob is copied as overlapping windows of 8,000 bytes, starting every 4,000
+  bytes. Any match up to 4,000 bytes long lies whole inside one window.
+- **Header and canary:** each window starts with a 1,024-byte header holding a fresh canary key.
+  The header covers every offset file-type sniffing looks at.
+- **Proof of reading:** the canary must be found in every window. If any window wasn't read,
+  for whatever reason, nothing is committed.
+- **Private keys:** the runner refuses any private key itself, because an encoded key block
+  can be longer than a window. It looks for the words `PRIVATE KEY`:
+  - as a PEM header;
+  - base64-encoded at every alignment (standard or URL-safe);
+  - URL- or form-encoded;
+  - as hex.
+
+  It matches those words rather than `-----BEGIN`, so base64 certificates (as in a kubeconfig)
+  still pass.
+- **Known limit:** an encoded secret inside a single base64 run longer than 4,000 bytes may not
+  decode in any window. GitHub's own secret scanning is the backstop there.
+
+Nothing in the repo can configure the scan:
 - **Repo config files:** `.gitleaks.toml`, `gitleaks.toml` and `.gitleaksignore` are renamed in
   the copy, so they're scanned as content but never act as config. Each file is copied into
   its own directory, so a renamed copy can't overwrite another file.
@@ -144,9 +214,15 @@ repo can configure the scan:
 - **Config:** the runner's own `gitleaks.toml` is used. It's gitleaks v8.21.2's 195 default
   rules **without the default global path allowlist**. That list would otherwise skip
   `gitleaks.toml`, `go.sum`, `vendor/`, `node_modules/`, lock files, images and PDFs entirely.
-  The `true|false|null` allowlist regex is grouped, so it matches only those exact values.
-- **Encoded secrets:** base64 and similar encodings are decoded, up to 3 levels deep.
-- **Size:** a file larger than `OPS_SCAN_MAX_MB` (default 50) is refused rather than skipped.
+  The `true|false|null` allowlist regex is grouped, so it matches only those exact values. The
+  two per-rule path allowlists are removed too: a file named `@octokit/auth-token/README.md`
+  would otherwise hide GitHub tokens.
+- **Encoded secrets:** gitleaks 8.21.2 decodes base64 only, up to 3 levels deep. Other
+  encodings are caught only for private keys, by the runner's own check.
+- **Size:** a file larger than `OPS_SCAN_MAX_MB` (default 50, in millions of bytes) is refused
+  rather than skipped.
+- **File count:** a chunk listing more than `OPS_MAX_FILES` paths (default 5,000) is refused
+  before any git work.
 - **Archives:** gzip, zip (including `.docx`, `.xlsx` and `.jar`), bzip2, xz, 7z, zstd, rar and tar
   files are refused, since the scan can't see inside them. Add such files by hand, outside the
   pipeline.
@@ -208,6 +284,41 @@ runner as a subprocess or the coordinator loop.
   - E26: gzip and tar files are refused.
   - E27: a planted git repository with its own filter is refused before git touches it, listed
     or not, in the runner and the coordinator.
+- **Bundle mode:**
+  - B1: a clean chunk is `PUSHED` and the same bundle again is `ALREADY_COMMITTED`.
+  - B2: executable files, symlinks and deletions give the same tree as worktree mode.
+  - B3: tampered bytes are refused.
+  - B4: malformed bundles are refused, each with one JSON answer:
+    - a missing or unlisted blob;
+    - a submodule or directory mode;
+    - bad base64;
+    - a `.git` path;
+    - a file where the base has a directory;
+    - `main`.
+  - B5: a secret is caught.
+  - B6: the worktree is never read, even with a planted repository in it, or with it deleted.
+  - B7: the size limit holds.
+  - B8: a file changed after verify means no bundle is sent.
+  - B9: the coordinator loop works through `OPS_RUNNER_CMD` and the SSH entry script,
+    including stale-base recovery.
+- **Bundle review fixes:**
+  - R1: a key behind a PDF, RTF or PostScript prefix, binary magic later in the file, or a
+    key across a 10 KB or window boundary or far into a large file, is found. A PDF-like
+    file with no secret still passes.
+  - R2: the size limit is the scan's limit.
+  - R3: a key in the commit body, or a token-shaped `Task-Id`, is found.
+  - R4: deeply nested JSON still gets one JSON answer.
+  - R5: `.git` look-alikes (HFS-ignored characters, `GIT~1`, `.git.`) are refused.
+  - R6: the file-count cap holds, and 1,000 files stage quickly.
+  - R7: private key blocks are refused, including ones longer than a window. A GitHub token in
+    `@octokit/auth-token/README.md` is found.
+  - R8: a 4096-bit key is refused base64-encoded at any offset, URL-encoded, form-encoded or as
+    hex. A base64 certificate still passes.
+- **Credential helper:**
+  - C1: the JWT is signed by the App key and names the App.
+  - C1: the token asked for is one repository with `contents: write` only.
+  - C1: other hosts get no credential.
+  - C1: a failure leaks neither the key nor the JWT.
 
 ## Environment
 
@@ -221,12 +332,17 @@ runner as a subprocess or the coordinator loop.
 | `OPS_GITLEAKS_CONFIG` | `gitleaks.toml` next to the runner |
 | `OPS_SCAN_MAX_MB` | `50` |
 | `OPS_AUTHOR_NAME`, `OPS_AUTHOR_EMAIL` | `ops-runner` |
+| `OPS_BUNDLE_MAX_MB` | `100`: the largest bundle read from stdin |
+| `OPS_GH_APP_ID`, `OPS_GH_INSTALLATION_ID`, `OPS_GH_APP_KEY`, `OPS_GH_REPO` | the credential helper's App, installation, key path and repository |
+| `OPS_MAX_FILES` | `5000`: the most paths one chunk may list |
+| `OPS_RUNNER_CMD` | coordinator side: the command that reaches the runner's machine; bundles are sent when it is set |
 | `OPS_TEST_PAUSE_FILE` | tests only: makes the runner pause before the push |
 
 The coordinator reads `OPS_REMOTE_URL` too (or `land_chunk(..., remote_url=...)`). It needs
 read access only.
 
-Requires Python 3.9+ and git 2.38+ (for `merge-tree --write-tree`).
+Requires Python 3.9+, git 2.38+ (for `merge-tree --write-tree`) and, for the credential helper,
+the `openssl` command.
 
 The runner is only a real boundary once it is the only thing that can push: see
 [docs/infrastructure.md](docs/infrastructure.md).
