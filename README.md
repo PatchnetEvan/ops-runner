@@ -194,8 +194,15 @@ that don't overlap, and stops reading a file at the first chunk that looks binar
   The header covers every offset file-type sniffing looks at.
 - **Proof of reading:** the canary must be found in every window. If any window wasn't read,
   for whatever reason, nothing is committed.
-- **Private keys:** a `-----BEGIN … PRIVATE KEY` block is refused outright, since a key block
-  can be longer than a window.
+- **Private keys:** the runner refuses any private key itself, because an encoded key block
+  can be longer than a window. It looks for the words `PRIVATE KEY`:
+  - as a PEM header;
+  - base64-encoded at every alignment (standard or URL-safe);
+  - URL- or form-encoded;
+  - as hex.
+
+  It matches those words rather than `-----BEGIN`, so base64 certificates (as in a kubeconfig)
+  still pass.
 - **Known limit:** an encoded secret inside a single base64 run longer than 4,000 bytes may not
   decode in any window. GitHub's own secret scanning is the backstop there.
 
@@ -210,7 +217,8 @@ Nothing in the repo can configure the scan:
   The `true|false|null` allowlist regex is grouped, so it matches only those exact values. The
   two per-rule path allowlists are removed too: a file named `@octokit/auth-token/README.md`
   would otherwise hide GitHub tokens.
-- **Encoded secrets:** base64 and similar encodings are decoded, up to 3 levels deep.
+- **Encoded secrets:** gitleaks 8.21.2 decodes base64 only, up to 3 levels deep. Other
+  encodings are caught only for private keys, by the runner's own check.
 - **Size:** a file larger than `OPS_SCAN_MAX_MB` (default 50, in millions of bytes) is refused
   rather than skipped.
 - **File count:** a chunk listing more than `OPS_MAX_FILES` paths (default 5,000) is refused
@@ -304,6 +312,8 @@ runner as a subprocess or the coordinator loop.
   - R6: the file-count cap holds, and 1,000 files stage quickly.
   - R7: private key blocks are refused, including ones longer than a window. A GitHub token in
     `@octokit/auth-token/README.md` is found.
+  - R8: a 4096-bit key is refused base64-encoded at any offset, URL-encoded, form-encoded or as
+    hex. A base64 certificate still passes.
 - **Credential helper:**
   - C1: the JWT is signed by the App key and names the App.
   - C1: the token asked for is one repository with `contents: write` only.

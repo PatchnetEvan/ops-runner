@@ -1071,5 +1071,28 @@ def r07_private_key_and_octokit_path(w):
     ok(r['status'] == 'HOOK_FAILED', 'R7 a GitHub token in a file named @octokit/auth-token/README.md: found', r['status'])
 
 
+
+@case
+def r08_encoded_private_keys(w):
+    import urllib.parse
+    pem = sh(w.tmp, 'openssl', 'genrsa', '4096').encode() + b'\n'
+    cert = subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', '/dev/null',
+                           '-subj', '/CN=ops-test', '-days', '1'], capture_output=True).stdout
+    b64 = base64.b64encode(pem)
+    def at(offset, value):
+        prefix = b'{"filler": "' + b'x' * (offset - 25) + b'", "tls_key": "'
+        return prefix + value + b'"}\n'
+    cases = {f'base64 4096-bit key starting at {off}': at(off, b64) for off in (3713, 3913, 6013)}
+    cases.update({'URL-encoded key': urllib.parse.quote(pem).encode(),
+                  'form-encoded key': urllib.parse.quote_plus(pem).encode(),
+                  'hex key': pem.hex().encode()})
+    for name, data in cases.items():
+        r = w.run_bundle(bundle_with(w, 'chunk_r08', {'config/app.json': data}))
+        ok(r['status'] == 'HOOK_FAILED' and 'private-key' in r['detail'], f'R8 {name}: refused', (r['status'], r['detail'][:100]))
+    r = w.run_bundle(bundle_with(w, 'chunk_r08b', {'config/kube.yaml': b'certificate-authority-data: ' + base64.b64encode(cert) + b'\n'}))
+    ok(r['status'] == 'PUSHED', 'R8 a base64 certificate (no key): PUSHED', (r['status'], r['detail'][:150]))
+    ok(w.commits_with('chunk_r08') == 0, 'R8 no key pushed')
+
+
 print(f'\n{passed} passed, {failed} failed')
 sys.exit(1 if failed else 0)

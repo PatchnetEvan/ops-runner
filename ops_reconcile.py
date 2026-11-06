@@ -379,6 +379,33 @@ WINDOW, STEP, HEADER = 8000, 4000, 1024
 PRIVATE_KEY = re.compile(rb'-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY')
 
 
+def _b64_markers(word):
+    """The base64 text that encodes `word` at each of the three byte
+    alignments, trimmed to the characters that depend only on `word`."""
+    out = []
+    for pad in range(3):
+        a = base64.b64encode(b'A' * pad + word + b'AAA').decode()
+        b = base64.b64encode(b'z' * pad + word + b'zzz').decode()
+        common = ''.join(x if x == y else '\0' for x, y in zip(a, b))
+        run = max(common.split('\0'), key=len)
+        out += [run, run.replace('+', '-').replace('/', '_')]
+    return sorted(set(out))
+
+
+# A key block can be longer than a scan window once encoded (base64 of a
+# 4096-bit PEM is ~4,400 bytes), and gitleaks 8.21.2 decodes only base64. So the
+# runner looks for the words "PRIVATE KEY" itself: raw, URL-encoded, hex, and
+# base64 at every alignment. Matching the words (not "-----BEGIN") keeps
+# base64 certificates, e.g. in a kubeconfig, from being refused.
+B64_PRIVATE_KEY = re.compile('|'.join(re.escape(m) for m in _b64_markers(b'PRIVATE KEY')).encode())
+TEXT_PRIVATE_KEY = re.compile(rb'PRIVATE(?:%20|\+|\\x20|\\u0020|&#32;|&#x20;)KEY|' + b'PRIVATE KEY'.hex().encode(),
+                              re.IGNORECASE)
+
+
+def private_key_in(blob):
+    return bool(PRIVATE_KEY.search(blob) or B64_PRIVATE_KEY.search(blob) or TEXT_PRIVATE_KEY.search(blob))
+
+
 def windows(blob):
     if len(blob) <= WINDOW:
         return [blob]
@@ -396,8 +423,8 @@ def scan(repo, index, files, message):
     modified file, and the commit message, with the runner's own config.
     Nothing in the repo can configure the scan: config and ignore files are
     renamed in the copy (still scanned as content), gitleaks:allow comments
-    are ignored, encoded secrets are decoded, a private key block is refused
-    outright, and anything gitleaks didn't read (too large, an archive, or a
+    are ignored, base64 is decoded, a private key is refused outright in any
+    common encoding, and anything gitleaks didn't read (too large, an archive, or a
     window it took for binary) means nothing is committed."""
     binary = os.environ.get('OPS_GITLEAKS', 'gitleaks')
     config = os.environ.get('OPS_GITLEAKS_CONFIG', os.path.join(HERE, 'gitleaks.toml'))
@@ -420,7 +447,7 @@ def scan(repo, index, files, message):
         items.append((path, path, blob))
     items.append(('the commit message', 'COMMIT_EDITMSG', message.encode()))
     for label, _, blob in items:
-        if PRIVATE_KEY.search(blob):
+        if private_key_in(blob):
             raise Result(HOOK_FAILED, json.dumps({'secrets_found': [{'rule': 'private-key', 'file': label}]}))
 
     with tempfile.TemporaryDirectory() as tree, tempfile.TemporaryDirectory() as empty, \
